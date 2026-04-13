@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XGBoost-SHAP 图例绘制脚本
+SHAP 图例绘制脚本
 =========================
-基于 experiment.py 训练好的 XGBoost 模型，生成论文所需的全部图例。
+基于 experiment.py 训练好的最优模型，生成论文所需的全部图例。
+支持为不同因变量选择不同的 SHAP 分析模型（XGBOOST / LightGBM）。
 
 必做图例（⭐⭐⭐）：
   图1: 模型性能验证图（三联组合图）
@@ -74,6 +75,14 @@ EXCLUDE_COLS = ['街区编号', TARGET_A, TARGET_B]
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 N_JOBS = -1
+
+# ============ SHAP 分析模型配置 ============
+# 为每个因变量指定用于 SHAP 分析的模型（可选: 'XGBOOST' 或 'LightGBM'）
+# 根据实验结果选择各因变量表现最优的模型
+SHAP_MODEL_CONFIG = {
+    TARGET_A: 'LightGBM',   # 步行比例 — LightGBM 表现最优
+    TARGET_B: 'XGBOOST',    # 步行距离 — XGBoost 表现最优
+}
 
 # SHAP 依赖图选取的 Top 特征数量
 TOP_N_DEPENDENCE = 8
@@ -219,14 +228,16 @@ def compute_shap_interaction_values(model, X_data, feature_cols):
 # =====================================================================
 #  图1: 模型性能验证图（三联组合图）
 # =====================================================================
-def plot_1_model_performance(y_test, test_results, target_name, plot_dir=PLOT_DIR):
+def plot_1_model_performance(y_test, test_results, target_name, shap_model_name='XGBOOST', plot_dir=PLOT_DIR):
     """
     三联组合图：
-    (a) 多模型 R² 对比柱状图（10折CV）
-    (b) XGBoost 预测值 vs 实际值散点图
-    (c) XGBoost 残差直方图
+    (a) 多模型 R² 对比柱状图
+    (b) 最优模型 预测值 vs 实际值散点图
+    (c) 最优模型 残差直方图
     """
-    log.info(f"绘制图1: 模型性能验证图 — {target_name}")
+    log.info(f"绘制图1: 模型性能验证图 — {target_name}（SHAP模型: {shap_model_name}）")
+
+    model_color = MODEL_COLORS.get(shap_model_name, '#e74c3c')
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
 
@@ -237,9 +248,9 @@ def plot_1_model_performance(y_test, test_results, target_name, plot_dir=PLOT_DI
     colors = [MODEL_COLORS.get(m, '#95a5a6') for m in model_names]
 
     bars = ax.bar(model_names, r2_values, color=colors, edgecolor='white', linewidth=0.8, width=0.6)
-    # 高亮 XGBoost
+    # 高亮 SHAP 分析所用的模型
     for i, m in enumerate(model_names):
-        if m == 'XGBOOST':
+        if m == shap_model_name:
             bars[i].set_edgecolor('#c0392b')
             bars[i].set_linewidth(2.5)
 
@@ -255,12 +266,12 @@ def plot_1_model_performance(y_test, test_results, target_name, plot_dir=PLOT_DI
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
 
-    # --- (b) XGBoost 预测值 vs 实际值散点图 ---
+    # --- (b) 最优模型 预测值 vs 实际值散点图 ---
     ax = axes[1]
-    y_pred_xgb = test_results['XGBOOST']['y_pred']
-    ax.scatter(y_test, y_pred_xgb, alpha=0.35, s=12, color='#e74c3c', edgecolors='none')
+    y_pred_best = test_results[shap_model_name]['y_pred']
+    ax.scatter(y_test, y_pred_best, alpha=0.35, s=12, color=model_color, edgecolors='none')
     # 45° 参考线
-    lims = [min(y_test.min(), y_pred_xgb.min()), max(y_test.max(), y_pred_xgb.max())]
+    lims = [min(y_test.min(), y_pred_best.min()), max(y_test.max(), y_pred_best.max())]
     margin = (lims[1] - lims[0]) * 0.05
     lims = [lims[0] - margin, lims[1] + margin]
     ax.plot(lims, lims, 'k--', linewidth=1, alpha=0.7, label='理想预测线 (y=x)')
@@ -268,19 +279,19 @@ def plot_1_model_performance(y_test, test_results, target_name, plot_dir=PLOT_DI
     ax.set_ylim(lims)
     ax.set_xlabel('实际值', fontsize=12)
     ax.set_ylabel('预测值', fontsize=12)
-    ax.set_title('(b) XGBoost 预测值 vs 实际值', fontsize=13, fontweight='bold')
-    r2_xgb = test_results['XGBOOST']['metrics']['R²']
-    ax.text(0.05, 0.92, f'R²={r2_xgb:.4f}', transform=ax.transAxes,
-            fontsize=11, fontweight='bold', color='#e74c3c',
+    ax.set_title(f'(b) {shap_model_name} 预测值 vs 实际值', fontsize=13, fontweight='bold')
+    r2_best = test_results[shap_model_name]['metrics']['R²']
+    ax.text(0.05, 0.92, f'R²={r2_best:.4f}', transform=ax.transAxes,
+            fontsize=11, fontweight='bold', color=model_color,
             bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
     ax.legend(loc='lower right', fontsize=9)
     ax.grid(True, alpha=0.3)
     ax.set_aspect('equal')
 
-    # --- (c) XGBoost 残差直方图 ---
+    # --- (c) 最优模型 残差直方图 ---
     ax = axes[2]
-    residuals = y_test - y_pred_xgb
-    ax.hist(residuals, bins=40, color='#e74c3c', alpha=0.7, edgecolor='white', linewidth=0.5,
+    residuals = y_test - y_pred_best
+    ax.hist(residuals, bins=40, color=model_color, alpha=0.7, edgecolor='white', linewidth=0.5,
             density=True)
     # 叠加正态分布曲线
     from scipy.stats import norm
@@ -290,7 +301,7 @@ def plot_1_model_performance(y_test, test_results, target_name, plot_dir=PLOT_DI
     ax.axvline(x=0, color='gray', linestyle='--', linewidth=1, alpha=0.7)
     ax.set_xlabel('残差 (实际值 - 预测值)', fontsize=12)
     ax.set_ylabel('密度', fontsize=12)
-    ax.set_title('(c) XGBoost 残差分布', fontsize=13, fontweight='bold')
+    ax.set_title(f'(c) {shap_model_name} 残差分布', fontsize=13, fontweight='bold')
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
     ax.spines['top'].set_visible(False)
@@ -821,17 +832,20 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
     X_train_scaled = scaler.transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    # 获取 XGBoost 模型
-    xgb_model = trained_models.get('XGBOOST')
-    if xgb_model is None:
-        log.error("  未找到 XGBoost 模型，无法进行 SHAP 分析")
+    # 获取 SHAP 分析所用的模型
+    shap_model_name = SHAP_MODEL_CONFIG.get(target_name, 'XGBOOST')
+    shap_model = trained_models.get(shap_model_name)
+    if shap_model is None:
+        log.error(f"  未找到 {shap_model_name} 模型，无法进行 SHAP 分析")
         return
+    log.info(f"  SHAP 分析模型: {shap_model_name}")
 
     should_plot = lambda n: plot_ids is None or n in plot_ids
 
     # ===== 图1: 模型性能验证图 =====
     if should_plot(1):
-        plot_1_model_performance(y_test, test_results, target_name, plot_dir=target_plot_dir)
+        plot_1_model_performance(y_test, test_results, target_name,
+                                 shap_model_name=shap_model_name, plot_dir=target_plot_dir)
 
     # ===== 图10: 各模型残差图 =====
     if should_plot(10):
@@ -845,7 +859,7 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
     shap_values = None
     if any(should_plot(n) for n in [2, 3, 4, 9]):
         shap_values, explainer = compute_shap_values(
-            xgb_model, X_train_scaled, feature_cols
+            shap_model, X_train_scaled, feature_cols
         )
 
     # ===== 图2: SHAP Bar Plot =====
@@ -862,13 +876,13 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
 
     # ===== 图5: 二维 PDP =====
     if should_plot(5):
-        plot_5_pdp_2d(xgb_model, X_train_scaled, feature_cols, target_name, scaler=scaler, plot_dir=target_plot_dir)
+        plot_5_pdp_2d(shap_model, X_train_scaled, feature_cols, target_name, scaler=scaler, plot_dir=target_plot_dir)
 
     # ===== 计算 SHAP 交互值（图6/7/8 共用） =====
     shap_interaction = None
     if any(should_plot(n) for n in [6, 7, 8]):
         shap_interaction = compute_shap_interaction_values(
-            xgb_model, X_train_scaled, feature_cols
+            shap_model, X_train_scaled, feature_cols
         )
 
     # ===== 图6: 交互效应矩阵 =====
@@ -896,7 +910,7 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='XGBoost-SHAP 图例绘制脚本',
+        description='SHAP 图例绘制脚本',
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument(
@@ -915,7 +929,7 @@ def main():
     args = parse_args()
 
     log.info("=" * 70)
-    log.info("  XGBoost-SHAP 图例绘制脚本")
+    log.info("  SHAP 图例绘制脚本")
     log.info("=" * 70)
     log.info(f"  开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info(f"  输出目录: {PLOT_DIR}")
