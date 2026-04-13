@@ -18,9 +18,13 @@ XGBoost-SHAP 图例绘制脚本
   图8: SHAP成对交互散点图
   图9: SHAP热力图（Heatmap）
 
+补充图例（从 experiment.py 迁移）：
+  图10: 各模型残差图（测试集）
+  图11: 最佳树模型特征重要性图
+
 使用方式：
   python plot_shap.py                    # 绘制所有图例
-  python plot_shap.py --plots 1 2 3      # 只绘制指定编号的图例
+  python plot_shap.py --plots 1 2 3      # 只绘制指定编号的图例（1-11）
 python plot_shap.py --target 步行比例  # 只绘制指定因变量的图例
 """
 
@@ -687,6 +691,99 @@ def plot_9_shap_heatmap(shap_values, feature_cols, target_name, plot_dir=PLOT_DI
 
 
 # =====================================================================
+#  图10: 各模型残差图（测试集）
+# =====================================================================
+def plot_10_residuals(y_test, test_results, target_name, plot_dir=PLOT_DIR):
+    """
+    绘制所有模型的残差图（子图排列）。
+    从 experiment.py 迁移而来。
+    """
+    log.info(f"绘制图10: 各模型残差图 — {target_name}")
+
+    model_names = list(test_results.keys())
+    n_models = len(model_names)
+
+    fig, axes = plt.subplots(1, n_models, figsize=(5 * n_models, 4.5), sharey=True)
+    if n_models == 1:
+        axes = [axes]
+
+    colors_list = ['#7f8c8d', '#3498db', '#2ecc71', '#e74c3c', '#9b59b6']
+
+    for idx, name in enumerate(model_names):
+        ax = axes[idx]
+        y_pred = test_results[name]['y_pred']
+        residuals = y_test - y_pred
+        ax.scatter(y_pred, residuals, alpha=0.3, s=10,
+                   color=colors_list[idx % len(colors_list)], edgecolors='none')
+        ax.axhline(y=0, color='red', linestyle='--', linewidth=1)
+        ax.set_xlabel('预测值', fontsize=11)
+        if idx == 0:
+            ax.set_ylabel('残差', fontsize=11)
+        ax.set_title(f'{name}', fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f'{target_name} — 各模型残差图（测试集）', fontsize=14, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    save_path = os.path.join(plot_dir, f'图10_残差图_{target_name}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    log.info(f"  已保存: {save_path}")
+
+
+# =====================================================================
+#  图11: 最佳树模型特征重要性图
+# =====================================================================
+def plot_11_feature_importance(trained_models, test_results, feature_cols, target_name, plot_dir=PLOT_DIR):
+    """
+    使用测试集 R² 最高的树模型绘制特征重要性条形图。
+    从 experiment.py 迁移而来。
+    """
+    log.info(f"绘制图11: 特征重要性图 — {target_name}")
+
+    # 找到测试集 R² 最高的树模型
+    tree_models = ['GBDT', 'RF', 'XGBOOST', 'LightGBM']
+    best_tree_name = None
+    best_r2 = -np.inf
+    for name in tree_models:
+        if name in test_results and name in trained_models:
+            r2 = test_results[name]['metrics']['R\u00b2']
+            if r2 > best_r2:
+                best_r2 = r2
+                best_tree_name = name
+
+    if best_tree_name is None:
+        log.warning("  未找到可用的树模型，跳过特征重要性图")
+        return
+
+    best_model = trained_models[best_tree_name]
+    if not hasattr(best_model, 'feature_importances_'):
+        log.warning(f"  {best_tree_name} 不支持 feature_importances_，跳过")
+        return
+
+    log.info(f"  使用最佳树模型: {best_tree_name} (R\u00b2={best_r2:.4f})")
+
+    importance = best_model.feature_importances_
+    feat_imp = pd.DataFrame({
+        '特征': feature_cols,
+        '重要性': importance
+    }).sort_values('重要性', ascending=True).reset_index(drop=True)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.barh(feat_imp['特征'], feat_imp['重要性'], color='#2ca02c', alpha=0.8)
+    ax.set_xlabel('特征重要性', fontsize=12)
+    ax.set_title(f'{target_name} — {best_tree_name}（调优后）特征重要性', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='x')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+
+    save_path = os.path.join(plot_dir, f'图11_特征重要性_{target_name}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    log.info(f"  已保存: {save_path}")
+
+
+# =====================================================================
 #  主流程
 # =====================================================================
 def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
@@ -735,6 +832,14 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
     # ===== 图1: 模型性能验证图 =====
     if should_plot(1):
         plot_1_model_performance(y_test, test_results, target_name, plot_dir=target_plot_dir)
+
+    # ===== 图10: 各模型残差图 =====
+    if should_plot(10):
+        plot_10_residuals(y_test, test_results, target_name, plot_dir=target_plot_dir)
+
+    # ===== 图11: 特征重要性图 =====
+    if should_plot(11):
+        plot_11_feature_importance(trained_models, test_results, feature_cols, target_name, plot_dir=target_plot_dir)
 
     # ===== 计算 SHAP 值（图2/3/4/9 共用） =====
     shap_values = None
@@ -786,6 +891,7 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
         plot_9_shap_heatmap(shap_values, feature_cols, target_name, plot_dir=target_plot_dir)
 
     log.info(f"\n  {target_name} 所有图例绘制完成！")
+    log.info(f"  图例保存在: {target_plot_dir}")
 
 
 def parse_args():
@@ -795,7 +901,7 @@ def parse_args():
     )
     parser.add_argument(
         '--plots', type=int, nargs='+', default=None,
-        help='要绘制的图例编号（1-9），不指定则绘制全部\n例如: --plots 1 2 3'
+        help='要绘制的图例编号（1-11），不指定则绘制全部\n例如: --plots 1 2 3'
     )
     parser.add_argument(
         '--target', type=str, default=None,
@@ -817,7 +923,7 @@ def main():
     if args.plots:
         log.info(f"  指定绘制图例: {args.plots}")
     else:
-        log.info("  绘制全部图例 (1-9)")
+        log.info("  绘制全部图例 (1-11)")
 
     # 加载数据
     X, y_a, y_b, feature_cols = load_data()

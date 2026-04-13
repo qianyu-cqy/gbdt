@@ -11,7 +11,6 @@
   2. 在训练集上使用 RandomizedSearchCV（内层5折交叉验证）进行超参数调优
   3. 使用最优参数在完整训练集上重新训练
   4. 在 hold-out 测试集上评估最终性能（MAE、MSE、RMSE、R²）
-  5. 额外进行10折交叉验证报告泛化性能
 
 数据规模：~3028 样本，24 个自变量（中小规模数据集）
 对比模型：OLS、GBDT、RF、XGBOOST、LightGBM
@@ -65,7 +64,6 @@ EXCLUDE_COLS = ['街区编号', TARGET_A, TARGET_B]
 
 TEST_SIZE = 0.2          # 测试集比例
 INNER_CV_FOLDS = 5       # 调参内层交叉验证折数
-OUTER_CV_FOLDS = 10      # 外层交叉验证折数（泛化性能评估）
 N_ITER_SEARCH = 60       # RandomizedSearchCV 最大搜索次数（提升采样量，充分探索大搜索空间）
 RANDOM_STATE = 42
 N_JOBS = -1              # 并行核数
@@ -325,90 +323,7 @@ def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
     return best_estimator, best_params, best_cv_mse
 
 
-# ============ 外层10折交叉验证（泛化性能） ============
-# 不需要进度条的快速模型（运算耗时极短，进度条反而干扰输出）
-FAST_MODELS = {'OLS'}
 
-def outer_cross_validate(model_name, best_params, X, y):
-    """
-    使用最优参数进行外层10折交叉验证，评估泛化性能
-    - 快速模型（如OLS）不显示进度条
-    - 耗时模型显示进度条（delay=0.5s 防止提前渲染）
-    """
-    outer_cv = KFold(n_splits=OUTER_CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    scaler = StandardScaler()
-
-    all_y_true = []
-    all_y_pred = []
-
-    folds = list(outer_cv.split(X))
-    use_pbar = model_name not in FAST_MODELS
-
-    if use_pbar:
-        sys.stdout.flush()
-        pbar = tqdm(
-            folds,
-            desc=f"    {model_name} 10折CV",
-            unit="折",
-            ncols=90,
-            delay=0.5,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
-        )
-        iterator = pbar
-    else:
-        iterator = folds
-
-    for train_idx, test_idx in iterator:
-        X_tr, X_te = X[train_idx], X[test_idx]
-        y_tr, y_te = y[train_idx], y[test_idx]
-
-        X_tr_s = scaler.fit_transform(X_tr)
-        X_te_s = scaler.transform(X_te)
-
-        if model_name == 'OLS':
-            y_pred, _ = ols_fit_predict(X_tr_s, y_tr, X_te_s)
-        else:
-            model = create_model_with_params(model_name, best_params)
-            model.fit(X_tr_s, y_tr)
-            y_pred = model.predict(X_te_s)
-
-        all_y_true.extend(y_te)
-        all_y_pred.extend(y_pred)
-
-    if use_pbar:
-        pbar.close()
-    return np.array(all_y_true), np.array(all_y_pred)
-
-
-# ============ 残差图绘制 ============
-def plot_residuals(results_dict, target_name, output_path):
-    """绘制所有模型的残差图（子图排列）"""
-    model_names = list(results_dict.keys())
-    n_models = len(model_names)
-
-    fig, axes = plt.subplots(1, n_models, figsize=(5 * n_models, 4.5), sharey=True)
-    if n_models == 1:
-        axes = [axes]
-
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
-
-    for idx, (name, (y_true, y_pred)) in enumerate(results_dict.items()):
-        ax = axes[idx]
-        residuals = y_true - y_pred
-        ax.scatter(y_pred, residuals, alpha=0.3, s=10, color=colors[idx % len(colors)],
-                   edgecolors='none')
-        ax.axhline(y=0, color='red', linestyle='--', linewidth=1)
-        ax.set_xlabel('预测值', fontsize=11)
-        if idx == 0:
-            ax.set_ylabel('残差', fontsize=11)
-        ax.set_title(f'{name}', fontsize=12, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-
-    fig.suptitle(f'{target_name} — 各模型残差图（测试集）', fontsize=14, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    log(f"  残差图已保存: {output_path}")
 
 
 # ============ 结果表格输出 ============
@@ -456,7 +371,7 @@ def print_and_save_table(headers, table_data, target_name, output_path):
 
 # ============ 特征重要性分析 ============
 def analyze_feature_importance(best_model, model_name, feature_cols, target_name, X_train, y_train):
-    """使用调优后的最佳模型分析特征重要性"""
+    """使用调优后的最佳模型分析特征重要性（仅输出文本和CSV，绘图由 plot_shap.py 负责）"""
     if not hasattr(best_model, 'feature_importances_'):
         log(f"  {model_name} 不支持特征重要性分析，跳过")
         return None
@@ -472,22 +387,9 @@ def analyze_feature_importance(best_model, model_name, feature_cols, target_name
                          headers=['特征', '重要性'], tablefmt='grid', floatfmt='.4f')
     log(table_str)
 
-    # 绘制特征重要性图
-    fig, ax = plt.subplots(figsize=(10, 6))
-    feat_imp_sorted = feat_imp.sort_values('重要性', ascending=True)
-    ax.barh(feat_imp_sorted['特征'], feat_imp_sorted['重要性'], color='#2ca02c', alpha=0.8)
-    ax.set_xlabel('特征重要性', fontsize=12)
-    ax.set_title(f'{target_name} — {model_name}（调优后）特征重要性', fontsize=14, fontweight='bold')
-    ax.grid(True, alpha=0.3, axis='x')
-    plt.tight_layout()
-
-    output_path = os.path.join(OUTPUT_DIR, f'feature_importance_{target_name}.png')
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    log(f"  特征重要性图已保存: {output_path}")
-
     csv_path = os.path.join(OUTPUT_DIR, f'feature_importance_{target_name}.csv')
     feat_imp.to_csv(csv_path, index=False, encoding='utf-8-sig')
+    log(f"  特征重要性CSV已保存: {csv_path}")
 
     return feat_imp
 
@@ -623,10 +525,10 @@ def main():
     log("=" * 80)
     if infer_mode:
         log("  步行活力与步行范围的多模型对比实验【推理模式】")
-        log("  流程: 加载最优参数 → 训练 → 测试集评估 → 外层10折CV")
+        log("  流程: 加载最优参数 → 训练 → 测试集评估")
     else:
         log("  步行活力与步行范围的多模型对比实验【调优模式】")
-        log("  流程: 数据划分 → 超参数调优(内层5折CV) → 测试集评估 → 外层10折CV")
+        log("  流程: 数据划分 → 超参数调优(内层5折CV) → 测试集评估")
     log("=" * 80)
     log(f"  运行模式: {'推理模式 (--mode infer)' if infer_mode else '调优模式 (--mode tune)'}")
     log(f"  实验开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -688,9 +590,7 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
 
         # 存储结果
         test_metrics = {}       # 测试集指标
-        cv_metrics = {}         # 10折CV指标
-        test_predictions = {}   # 测试集预测值（用于残差图）
-        cv_predictions = {}     # CV预测值（用于残差图）
+        test_predictions = {}   # 测试集预测值
         all_best_params = {}    # 最优参数
         best_trained_models = {}  # 训练好的最佳模型
 
@@ -705,16 +605,9 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
         test_predictions['OLS'] = (y_test, y_pred_test_ols)
         all_best_params['OLS'] = None
 
-        # OLS 外层10折CV
-        y_true_cv, y_pred_cv = outer_cross_validate('OLS', {}, X, y)
-        cv_metrics['OLS'] = compute_metrics(y_true_cv, y_pred_cv)
-        cv_predictions['OLS'] = (y_true_cv, y_pred_cv)
-
         ols_elapsed = time.time() - ols_start
         m = test_metrics['OLS']
         log(f"    测试集: MAE={m['MAE']:.4f}  MSE={m['MSE']:.4f}  RMSE={m['RMSE']:.4f}  R²={m['R²']:.4f}")
-        m_cv = cv_metrics['OLS']
-        log(f"    10折CV: MAE={m_cv['MAE']:.4f}  MSE={m_cv['MSE']:.4f}  RMSE={m_cv['RMSE']:.4f}  R²={m_cv['R²']:.4f}")
         log(f"    耗时: {ols_elapsed:.1f}秒")
 
         # ========== 步骤3: 树模型 ==========
@@ -765,15 +658,8 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
             all_best_params[model_name] = best_params
             best_trained_models[model_name] = best_model
 
-            # 外层10折CV（使用最优参数）
-            y_true_cv, y_pred_cv = outer_cross_validate(model_name, best_params, X, y)
-            cv_metrics[model_name] = compute_metrics(y_true_cv, y_pred_cv)
-            cv_predictions[model_name] = (y_true_cv, y_pred_cv)
-
             m = test_metrics[model_name]
             log(f"    测试集: MAE={m['MAE']:.4f}  MSE={m['MSE']:.4f}  RMSE={m['RMSE']:.4f}  R²={m['R²']:.4f}")
-            m_cv = cv_metrics[model_name]
-            log(f"    10折CV: MAE={m_cv['MAE']:.4f}  MSE={m_cv['MSE']:.4f}  RMSE={m_cv['RMSE']:.4f}  R²={m_cv['R²']:.4f}")
 
         # ========== 步骤4: 输出结果 ==========
         # 4.1 测试集性能对比表格
@@ -781,23 +667,10 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
         csv_path = os.path.join(OUTPUT_DIR, f'model_comparison_test_{target_col}.csv')
         print_and_save_table(headers, table_data, f'{description} — 测试集性能对比', csv_path)
 
-        # 4.2 10折CV性能对比表格
-        headers_cv, table_data_cv = format_results_table(cv_metrics, target_col)
-        csv_path_cv = os.path.join(OUTPUT_DIR, f'model_comparison_cv_{target_col}.csv')
-        print_and_save_table(headers_cv, table_data_cv, f'{description} — 10折交叉验证性能对比', csv_path_cv)
-
-        # 4.3 残差图（测试集）
-        residual_path = os.path.join(OUTPUT_DIR, f'residual_plot_test_{target_col}.png')
-        plot_residuals(test_predictions, f'{description}（测试集）', residual_path)
-
-        # 4.4 残差图（10折CV）
-        residual_path_cv = os.path.join(OUTPUT_DIR, f'residual_plot_cv_{target_col}.png')
-        plot_residuals(cv_predictions, f'{description}（10折CV）', residual_path_cv)
-
-        # 4.5 保存最优参数（调优模式和推理模式都保存，确保一致性）
+        # 4.2 保存最优参数（调优模式和推理模式都保存，确保一致性）
         save_best_params(all_best_params, target_col)
 
-        # 4.6 特征重要性分析（使用测试集表现最好的树模型）
+        # 4.3 特征重要性分析（使用测试集表现最好的树模型）
         if best_trained_models:
             best_tree_name = max(
                 [n for n in model_list if n in test_metrics],
@@ -809,7 +682,7 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
                 feature_cols, target_col, X_train_scaled, y_train
             )
 
-        # 4.7 OLS 回归摘要
+        # 4.4 OLS 回归摘要
         ols_summary(X_train, y_train, feature_cols, target_col)
 
     total_elapsed = time.time() - total_start
