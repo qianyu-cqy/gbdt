@@ -22,11 +22,13 @@ SHAP 图例绘制脚本
 补充图例（从 experiment.py 迁移）：
   图10: 各模型残差图（测试集）
   图11: 最佳树模型特征重要性图
+  图12: SHAP特征影响-交互网络图
 
 使用方式：
   python plot_shap.py                    # 绘制所有图例
   python plot_shap.py --plots 1 2 3      # 只绘制指定编号的图例（1-11）
-python plot_shap.py --target 步行比例  # 只绘制指定因变量的图例
+  python plot_shap.py --target 步行比例  # 只绘制指定因变量的图例
+  python plot_shap.py --plots 12         # 只绘制SHAP特征影响-交互网络图
 """
 
 import os
@@ -955,6 +957,192 @@ def plot_11_feature_importance(trained_models, test_results, feature_cols, targe
 
 
 # =====================================================================
+#  图12: SHAP 特征影响-交互网络图
+# =====================================================================
+def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_name, plot_dir=PLOT_DIR):
+    """
+    SHAP 特征影响-交互网络图。
+    - 节点 = 特征，大小 ∝ 平均 |SHAP| 主效应
+    - 节点颜色：平均 SHAP > 0 为蓝色（正向促进），< 0 为红色（负向抑制）
+    - 边 = 特征对之间的交互效应，粗细 ∝ 平均 |SHAP 交互值|
+    - 仅保留交互强度 Top 的边，避免过于密集
+    - 力导向布局（spring layout）
+    """
+    import networkx as nx
+    from matplotlib.lines import Line2D
+
+    log.info(f"绘制图12: SHAP特征影响-交互网络图 — {target_name}")
+
+    n_features = len(feature_cols)
+    shap_vals_array = shap_values.values  # (n_samples, n_features)
+
+    # ---- 1. 计算节点属性 ----
+    # 主效应强度（平均 |SHAP|）
+    mean_abs_shap = np.abs(shap_vals_array).mean(axis=0)  # (n_features,)
+    # 平均 SHAP 值（判断正/负方向）
+    mean_shap = shap_vals_array.mean(axis=0)  # (n_features,)
+
+    # ---- 2. 计算边属性（交互强度） ----
+    interaction_strengths = []
+    for i in range(n_features):
+        for j in range(i + 1, n_features):
+            strength = np.abs(shap_interaction[:, i, j]).mean()
+            interaction_strengths.append((i, j, strength))
+
+    # 按交互强度排序，取 Top N 条边（避免图过于密集）
+    interaction_strengths.sort(key=lambda x: x[2], reverse=True)
+    # 动态确定保留边数：最多保留 n_features * 1.5 条边，至少 10 条
+    max_edges = max(10, int(n_features * 1.5))
+    top_edges = interaction_strengths[:max_edges]
+
+    # 过滤掉强度极低的边（低于最大强度的 5%）
+    if len(top_edges) > 0:
+        max_strength = top_edges[0][2]
+        threshold = max_strength * 0.05
+        top_edges = [(i, j, s) for i, j, s in top_edges if s > threshold]
+
+    # ---- 3. 构建网络图 ----
+    G = nx.Graph()
+
+    # 添加节点
+    for i, feat in enumerate(feature_cols):
+        G.add_node(feat,
+                   importance=mean_abs_shap[i],
+                   direction=mean_shap[i])
+
+    # 添加边
+    for i, j, strength in top_edges:
+        G.add_edge(feature_cols[i], feature_cols[j], weight=strength)
+
+    # ---- 4. 布局 ----
+    # 使用 spring layout，重要性高的节点更居中
+    # k 参数控制节点间距，iterations 控制迭代次数
+    pos = nx.spring_layout(G, k=2.5, iterations=80, seed=RANDOM_STATE,
+                           weight='weight')
+
+    # ---- 5. 绘图 ----
+    fig, ax = plt.subplots(figsize=(14, 12))
+    ax.set_facecolor('#FAFAFA')
+
+    # 节点大小：映射到 [400, 3000] 范围
+    node_sizes_raw = np.array([G.nodes[n]['importance'] for n in G.nodes()])
+    if node_sizes_raw.max() > node_sizes_raw.min():
+        node_sizes = 400 + (node_sizes_raw - node_sizes_raw.min()) / \
+                     (node_sizes_raw.max() - node_sizes_raw.min()) * 2600
+    else:
+        node_sizes = np.full_like(node_sizes_raw, 1500)
+
+    # 节点颜色：正向蓝色，负向红色，颜色深浅 ∝ |平均SHAP|
+    node_directions = np.array([G.nodes[n]['direction'] for n in G.nodes()])
+    node_colors = []
+    for d, imp in zip(node_directions, node_sizes_raw):
+        # 归一化强度用于颜色深浅
+        if node_sizes_raw.max() > 0:
+            intensity = 0.3 + 0.7 * (imp / node_sizes_raw.max())
+        else:
+            intensity = 0.5
+        if d >= 0:
+            # 蓝色系（正向促进）
+            node_colors.append((0.2 * intensity, 0.4 * intensity, 0.9 * intensity, 0.85))
+        else:
+            # 红色系（负向抑制）
+            node_colors.append((0.9 * intensity, 0.25 * intensity, 0.2 * intensity, 0.85))
+
+    # 边宽度：映射到 [0.5, 8] 范围
+    edge_weights = np.array([G.edges[e]['weight'] for e in G.edges()])
+    if len(edge_weights) > 0 and edge_weights.max() > edge_weights.min():
+        edge_widths = 0.5 + (edge_weights - edge_weights.min()) / \
+                      (edge_weights.max() - edge_weights.min()) * 7.5
+    elif len(edge_weights) > 0:
+        edge_widths = np.full_like(edge_weights, 2.0)
+    else:
+        edge_widths = []
+
+    # 边颜色：强度越高越深
+    edge_colors = []
+    for w in edge_weights:
+        if edge_weights.max() > 0:
+            alpha = 0.15 + 0.7 * (w / edge_weights.max())
+        else:
+            alpha = 0.3
+        edge_colors.append((0.4, 0.4, 0.4, alpha))
+
+    # 绘制边
+    nx.draw_networkx_edges(G, pos, ax=ax,
+                           width=list(edge_widths),
+                           edge_color=edge_colors,
+                           style='solid')
+
+    # 绘制节点
+    nx.draw_networkx_nodes(G, pos, ax=ax,
+                           node_size=node_sizes,
+                           node_color=node_colors,
+                           edgecolors='white',
+                           linewidths=1.5)
+
+    # 绘制标签（白色文字，带阴影效果）
+    # 先绘制黑色阴影
+    label_offset = {k: (v[0], v[1]) for k, v in pos.items()}
+    nx.draw_networkx_labels(G, label_offset, ax=ax,
+                            font_size=9, font_weight='bold',
+                            font_color='white')
+
+    # ---- 6. 在边上标注交互强度数值（仅 Top 5） ----
+    top_label_edges = top_edges[:5]
+    for i, j, strength in top_label_edges:
+        feat_a = feature_cols[i]
+        feat_b = feature_cols[j]
+        if G.has_edge(feat_a, feat_b):
+            x = (pos[feat_a][0] + pos[feat_b][0]) / 2
+            y = (pos[feat_a][1] + pos[feat_b][1]) / 2
+            ax.annotate(f'{strength:.4f}',
+                        xy=(x, y), fontsize=7, fontweight='bold',
+                        color='#333333', ha='center', va='center',
+                        bbox=dict(boxstyle='round,pad=0.15', facecolor='#FFFFCC',
+                                  alpha=0.85, edgecolor='#CCCC00', linewidth=0.5))
+
+    # ---- 7. 图例 ----
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor=(0.2, 0.4, 0.9, 0.85),
+               markersize=14, label='正向促进 (SHAP > 0)'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor=(0.9, 0.25, 0.2, 0.85),
+               markersize=14, label='负向抑制 (SHAP < 0)'),
+        Line2D([0], [0], color='gray', linewidth=1, label='弱交互'),
+        Line2D([0], [0], color='gray', linewidth=5, label='强交互'),
+    ]
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=10,
+              framealpha=0.9, edgecolor='#CCCCCC', fancybox=True)
+
+    # ---- 8. 标题和样式 ----
+    ax.set_title(f'{target_name} — SHAP 特征影响-交互网络图',
+                 fontsize=15, fontweight='bold', pad=20)
+    ax.axis('off')
+
+    # 添加说明文字
+    fig.text(0.5, 0.02,
+             '节点大小 ∝ 特征主效应强度（平均|SHAP|）  |  '
+             '连线粗细 ∝ 特征对交互强度  |  '
+             '节点颜色：蓝=正向促进，红=负向抑制',
+             ha='center', fontsize=9, color='#666666',
+             style='italic')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    save_path = os.path.join(plot_dir, f'图12_SHAP特征交互网络图_{target_name}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    log.info(f"  已保存: {save_path}")
+
+    # 输出网络统计信息
+    log.info(f"  网络统计: {G.number_of_nodes()} 个节点, {G.number_of_edges()} 条边")
+    # 输出度中心性 Top 5
+    degree_centrality = nx.degree_centrality(G)
+    sorted_dc = sorted(degree_centrality.items(), key=lambda x: x[1], reverse=True)[:5]
+    log.info(f"  度中心性 Top 5:")
+    for rank, (feat, dc) in enumerate(sorted_dc, 1):
+        log.info(f"    {rank}. {feat}: {dc:.3f}")
+
+
+# =====================================================================
 #  主流程
 # =====================================================================
 def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
@@ -1015,9 +1203,9 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
     if should_plot(11):
         plot_11_feature_importance(trained_models, test_results, feature_cols, target_name, plot_dir=target_plot_dir)
 
-    # ===== 计算 SHAP 值（图2/3/4/9 共用） =====
+    # ===== 计算 SHAP 值（图2/3/4/9/12 共用） =====
     shap_values = None
-    if any(should_plot(n) for n in [2, 3, 4, 9]):
+    if any(should_plot(n) for n in [2, 3, 4, 9, 12]):
         shap_values, explainer = compute_shap_values(
             shap_model, X_train_scaled, feature_cols
         )
@@ -1038,9 +1226,9 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
     if should_plot(5):
         plot_5_pdp_2d(shap_model, X_train_scaled, feature_cols, target_name, scaler=scaler, plot_dir=target_plot_dir)
 
-    # ===== 计算 SHAP 交互值（图6/7/8 共用） =====
+    # ===== 计算 SHAP 交互值（图6/7/8/12 共用） =====
     shap_interaction = None
-    if any(should_plot(n) for n in [6, 7, 8]):
+    if any(should_plot(n) for n in [6, 7, 8, 12]):
         shap_interaction = compute_shap_interaction_values(
             shap_model, X_train_scaled, feature_cols
         )
@@ -1064,6 +1252,10 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
     if should_plot(9) and shap_values is not None:
         plot_9_shap_heatmap(shap_values, feature_cols, target_name, plot_dir=target_plot_dir)
 
+    # ===== 图12: SHAP 特征影响-交互网络图 =====
+    if should_plot(12) and shap_values is not None and shap_interaction is not None:
+        plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_name, plot_dir=target_plot_dir)
+
     log.info(f"\n  {target_name} 所有图例绘制完成！")
     log.info(f"  图例保存在: {target_plot_dir}")
 
@@ -1075,7 +1267,7 @@ def parse_args():
     )
     parser.add_argument(
         '--plots', type=int, nargs='+', default=None,
-        help='要绘制的图例编号（1-11），不指定则绘制全部\n例如: --plots 1 2 3'
+        help='要绘制的图例编号（1-12），不指定则绘制全部\n例如: --plots 1 2 3'
     )
     parser.add_argument(
         '--target', type=str, default=None,
@@ -1097,7 +1289,7 @@ def main():
     if args.plots:
         log.info(f"  指定绘制图例: {args.plots}")
     else:
-        log.info("  绘制全部图例 (1-11)")
+        log.info("  绘制全部图例 (1-12)")
 
     # 加载数据
     X, y_a, y_b, feature_cols = load_data()
