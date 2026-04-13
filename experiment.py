@@ -3,8 +3,8 @@
 """
 步行活力与步行范围的多模型对比实验（改进版）
 =============================================
-模型A：Y = 短距步行比例 ~ f(X₁, X₂, ..., X₂₃)  → 解释"步行活力的形成"
-模型B：Y = 步行距离     ~ f(X₁, X₂, ..., X₂₃)  → 解释"步行范围的限制"
+模型A：Y = 短距步行比例 ~ f(X₁, X₂, ..., X₂₄)  → 解释"步行活力的形成"
+模型B：Y = 步行距离     ~ f(X₁, X₂, ..., X₂₄)  → 解释"步行范围的限制"
 
 实验流程：
   1. 数据 80/20 划分为训练集和测试集（测试集完全隔离）
@@ -13,7 +13,7 @@
   4. 在 hold-out 测试集上评估最终性能（MAE、MSE、RMSE、R²）
   5. 额外进行10折交叉验证报告泛化性能
 
-数据规模：~3028 样本，23 个自变量（中小规模数据集）
+数据规模：~3028 样本，24 个自变量（中小规模数据集）
 对比模型：OLS、GBDT、RF、XGBOOST、LightGBM
 """
 
@@ -53,7 +53,7 @@ warnings.filterwarnings('ignore')
 
 # ============ 配置 ============
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, 'base_data.csv')
+DATA_PATH = os.path.join(BASE_DIR, 'new_data.csv')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'results')
 LOG_DIR = os.path.join(BASE_DIR, 'logs')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -66,7 +66,7 @@ EXCLUDE_COLS = ['街区编号', TARGET_A, TARGET_B]
 TEST_SIZE = 0.2          # 测试集比例
 INNER_CV_FOLDS = 5       # 调参内层交叉验证折数
 OUTER_CV_FOLDS = 10      # 外层交叉验证折数（泛化性能评估）
-N_ITER_SEARCH = 30       # RandomizedSearchCV 最大搜索次数
+N_ITER_SEARCH = 60       # RandomizedSearchCV 最大搜索次数（提升采样量，充分探索大搜索空间）
 RANDOM_STATE = 42
 N_JOBS = -1              # 并行核数
 
@@ -156,53 +156,69 @@ def get_param_grids():
     """
     为每个模型定义超参数搜索空间
 
-    设计原则（针对 ~3028 样本、23 特征的中小数据集）：
+    设计原则（针对 ~3028 样本、24 特征的中小数据集）：
     ─────────────────────────────────────────────────────
-    1. 树深度控制在较浅范围（3~6），防止在小数据上过拟合
-    2. n_estimators 适中（100~300），小数据集不需要太多树
-    3. learning_rate 偏保守（0.01~0.1），配合适中的树数量
-    4. min_samples_leaf / min_samples_split 适当增大，
+    1. 树深度控制在较浅范围（3~7），防止在小数据上过拟合
+    2. n_estimators 扩展到 500~800，适配低学习率场景
+       （lr=0.01 时需要更多树才能充分学习）
+    3. learning_rate 细化中间区域（增加 0.03/0.08 档位），
+       避免 0.01→0.05 跨度过大
+    4. min_samples_leaf 下限提高到 5（RF原为3，统计意义弱），
        确保叶节点有足够样本（训练集约2422样本）
-    5. subsample < 1.0 引入随机性，增强泛化
-    6. 正则化参数适当增大，抑制过拟合
+    5. subsample 扩展到 1.0，允许搜索不采样的情况
+    6. 正则化参数细化低区域（reg_lambda 增加 0.1/0.5 档位），
+       解决原搜索空间中正则化参数频繁命中边界的问题
+    7. 搜索次数从 30 提升到 60，提高大搜索空间的覆盖率
     """
     param_grids = {
         # GBDT: 不支持 n_jobs 并行，搜索空间需精简
+        # 优化：扩展 n_estimators/max_depth/subsample 上界（原值频繁命中边界）
+        #       细化 learning_rate 中间区域，增加 0.03 档位
+        #       n_estimators 扩展到 500 以适配低学习率场景
         'GBDT': {
-            'n_estimators': [100, 200, 300],
-            'max_depth': [3, 4, 5],           # 小数据集浅树即可
-            'learning_rate': [0.01, 0.05, 0.1],
-            'subsample': [0.7, 0.8, 0.9],     # 引入随机性防过拟合
-            'min_samples_leaf': [5, 10, 20],   # 叶节点至少5~20个样本
-            'min_samples_split': [10, 20],     # 分裂至少需要10~20个样本
+            'n_estimators': [100, 200, 300, 500],       # 扩展上界，适配低lr
+            'max_depth': [3, 4, 5, 6, 7],               # 扩展上界（原5频繁命中）
+            'learning_rate': [0.01, 0.03, 0.05, 0.1],   # 细化中间区域
+            'subsample': [0.7, 0.8, 0.9, 1.0],          # 扩展上界（原0.9命中）
+            'min_samples_leaf': [5, 10, 20],             # 保持不变，范围合理
+            'min_samples_split': [10, 20, 30],           # 增加30档位
         },
+        # RF: 优化正则化参数，防止过拟合
+        # 原 min_samples_leaf=3 过小（叶节点仅3样本，统计意义弱）
+        # 原 max_depth 从12直接跳到None，缺少中间过渡值
         'RF': {
-            'n_estimators': [100, 200, 300],
-            'max_depth': [5, 8, 12, None],     # None允许完全生长，但配合min_samples_leaf控制
-            'min_samples_split': [5, 10, 20],  # 小数据集适当增大
-            'min_samples_leaf': [3, 5, 10],    # 叶节点至少3~10个样本
-            'max_features': ['sqrt', 0.5, 0.7],  # 特征采样比例
+            'n_estimators': [200, 300, 500],             # 提高下限，RF对树数不敏感
+            'max_depth': [8, 12, 16, 20, None],          # 增加中间值，避免直接跳None
+            'min_samples_split': [5, 10, 15, 20],        # 增加15档位
+            'min_samples_leaf': [5, 10, 15, 20],         # 提高下限到5（原3过小）
+            'max_features': ['sqrt', 0.3, 0.5, 0.7],    # 增加0.3，更多特征采样选择
         },
+        # XGBOOST: 扩展边界命中参数，细化正则化区域
+        # 原 n_estimators=300 两次命中上界，reg_lambda=1.0 两次命中下界
         'XGBOOST': {
-            'n_estimators': [100, 200, 300],
-            'max_depth': [3, 4, 5, 6],         # 控制树深度
-            'learning_rate': [0.01, 0.05, 0.1],
-            'subsample': [0.7, 0.8, 0.9],
-            'colsample_bytree': [0.6, 0.7, 0.8],
-            'reg_alpha': [0, 0.1, 1.0],        # L1正则化
-            'reg_lambda': [1.0, 3.0, 5.0],     # L2正则化，适当增大
-            'min_child_weight': [3, 5, 10],     # 类似min_samples_leaf
+            'n_estimators': [100, 200, 300, 500],        # 扩展上界
+            'max_depth': [3, 4, 5, 6],                   # 保持不变，范围合理
+            'learning_rate': [0.01, 0.03, 0.05, 0.1],   # 细化中间区域
+            'subsample': [0.7, 0.8, 0.9, 1.0],          # 扩展上界
+            'colsample_bytree': [0.5, 0.6, 0.7, 0.8],   # 向下扩展（原0.6命中下界）
+            'reg_alpha': [0, 0.01, 0.1, 1.0],           # 细化低正则化区域
+            'reg_lambda': [0.1, 0.5, 1.0, 3.0, 5.0],   # 向下扩展（原1.0命中下界）
+            'min_child_weight': [3, 5, 10, 15],          # 增加15档位
         },
+        # LightGBM: 重点优化 lr与n_estimators耦合、正则化、num_leaves
+        # 原 lr=0.01时n_estimators=300远不够（有效学习量仅3）
+        # 原 reg_lambda=0 两次命中下界（完全无L2正则化）
+        # 原 num_leaves=50 对2422训练样本偏大
         'LightGBM': {
-            'n_estimators': [100, 200, 300],
-            'max_depth': [4, 6, 8],             # 限制深度
-            'learning_rate': [0.01, 0.05, 0.1],
-            'subsample': [0.7, 0.8, 0.9],
-            'colsample_bytree': [0.6, 0.7, 0.8],
-            'reg_alpha': [0, 0.1, 1.0],
-            'reg_lambda': [0, 1.0, 5.0],
-            'num_leaves': [15, 31, 50],         # 小数据集不宜太多叶子
-            'min_child_samples': [10, 20, 30],  # 叶节点最少样本数
+            'n_estimators': [200, 300, 500, 800],        # 大幅扩展，适配低lr
+            'max_depth': [4, 6, 8, -1],                  # -1不限制，由num_leaves控制
+            'learning_rate': [0.01, 0.03, 0.05, 0.08, 0.1],  # 细化中间区域
+            'subsample': [0.7, 0.8, 0.9, 1.0],          # 扩展上界
+            'colsample_bytree': [0.5, 0.6, 0.7, 0.8],   # 向下扩展
+            'reg_alpha': [0, 0.01, 0.1, 1.0],           # 细化低正则化区域
+            'reg_lambda': [0, 0.1, 0.5, 1.0, 3.0],     # 细化（原0频繁命中下界）
+            'num_leaves': [15, 20, 31, 40],              # 降低上限（原50偏大）
+            'min_child_samples': [10, 20, 30],           # 保持不变，范围合理
         },
     }
     return param_grids
@@ -264,12 +280,14 @@ def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
     best_params = None
     best_estimator = None
 
-    # 带进度条的搜索
+    # 带进度条的搜索（delay=0.5s 防止进度条提前渲染到终端）
+    sys.stdout.flush()
     pbar = tqdm(
         param_list,
         desc=f"    {model_name} 调参",
         unit="组合",
         ncols=90,
+        delay=0.5,
         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
     )
 
@@ -308,9 +326,14 @@ def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
 
 
 # ============ 外层10折交叉验证（泛化性能） ============
+# 不需要进度条的快速模型（运算耗时极短，进度条反而干扰输出）
+FAST_MODELS = {'OLS'}
+
 def outer_cross_validate(model_name, best_params, X, y):
     """
-    使用最优参数进行外层10折交叉验证，评估泛化性能（带进度条）
+    使用最优参数进行外层10折交叉验证，评估泛化性能
+    - 快速模型（如OLS）不显示进度条
+    - 耗时模型显示进度条（delay=0.5s 防止提前渲染）
     """
     outer_cv = KFold(n_splits=OUTER_CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     scaler = StandardScaler()
@@ -319,15 +342,23 @@ def outer_cross_validate(model_name, best_params, X, y):
     all_y_pred = []
 
     folds = list(outer_cv.split(X))
-    pbar = tqdm(
-        folds,
-        desc=f"    {model_name} 10折CV",
-        unit="折",
-        ncols=90,
-        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
-    )
+    use_pbar = model_name not in FAST_MODELS
 
-    for train_idx, test_idx in pbar:
+    if use_pbar:
+        sys.stdout.flush()
+        pbar = tqdm(
+            folds,
+            desc=f"    {model_name} 10折CV",
+            unit="折",
+            ncols=90,
+            delay=0.5,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+        )
+        iterator = pbar
+    else:
+        iterator = folds
+
+    for train_idx, test_idx in iterator:
         X_tr, X_te = X[train_idx], X[test_idx]
         y_tr, y_te = y[train_idx], y[test_idx]
 
@@ -344,7 +375,8 @@ def outer_cross_validate(model_name, best_params, X, y):
         all_y_true.extend(y_te)
         all_y_pred.extend(y_pred)
 
-    pbar.close()
+    if use_pbar:
+        pbar.close()
     return np.array(all_y_true), np.array(all_y_pred)
 
 
@@ -484,7 +516,7 @@ def ols_summary(X_train, y_train, feature_cols, target_name):
 
 
 # ============ 最优参数的保存与加载 ============
-BEST_PARAMS_DIR = os.path.join(OUTPUT_DIR, 'best_params')
+BEST_PARAMS_DIR = os.path.join(BASE_DIR, 'best_params')
 os.makedirs(BEST_PARAMS_DIR, exist_ok=True)
 
 
@@ -790,6 +822,7 @@ def main():
     log(f"  实验结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     if not infer_mode:
         log(f"  💡 下次可用推理模式快速运行: python experiment.py --mode infer")
+    log(f"  📊 绘制 SHAP 图例请运行: python plot_shap.py")
     log(f"{'='*80}")
 
 
