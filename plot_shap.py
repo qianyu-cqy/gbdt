@@ -350,40 +350,200 @@ def plot_3_shap_beeswarm(shap_values, feature_cols, target_name, plot_dir=PLOT_D
 
 
 # =====================================================================
-#  图4: SHAP 单特征依赖图（Dependence Plot）
+#  图4: SHAP 单特征依赖图（Dependence Plot）— LOWESS 增强版
 # =====================================================================
+def _find_lowess_zero_crossings(lowess_x, lowess_y):
+    """
+    找到 LOWESS 曲线与 y=0 的所有交叉点（线性插值）。
+    返回交叉点的 x 坐标列表。
+    """
+    crossings = []
+    for i in range(len(lowess_y) - 1):
+        if lowess_y[i] * lowess_y[i + 1] < 0:  # 符号变化
+            # 线性插值求交叉点
+            x_cross = lowess_x[i] - lowess_y[i] * (lowess_x[i + 1] - lowess_x[i]) / (lowess_y[i + 1] - lowess_y[i])
+            crossings.append(x_cross)
+    return crossings
+
+
+def _compute_lowess_with_ci(feat_vals, shap_vals, frac=0.3, n_bootstrap=200):
+    """
+    计算 LOWESS 拟合曲线及 Bootstrap 置信区间。
+    返回: lowess_x, lowess_y, ci_lower, ci_upper
+    """
+    from scipy.interpolate import interp1d
+
+    # 主 LOWESS 拟合
+    lowess = sm.nonparametric.lowess
+    fitted = lowess(shap_vals, feat_vals, frac=frac, return_sorted=True)
+    lowess_x = fitted[:, 0]
+    lowess_y = fitted[:, 1]
+
+    # Bootstrap 置信区间
+    bootstrap_curves = []
+    n_samples = len(feat_vals)
+    for _ in range(n_bootstrap):
+        idx = np.random.choice(n_samples, size=n_samples, replace=True)
+        try:
+            boot_fit = lowess(shap_vals[idx], feat_vals[idx], frac=frac, return_sorted=True)
+            f_interp = interp1d(boot_fit[:, 0], boot_fit[:, 1],
+                                bounds_error=False, fill_value=np.nan)
+            bootstrap_curves.append(f_interp(lowess_x))
+        except Exception:
+            continue
+
+    if len(bootstrap_curves) > 10:
+        bootstrap_array = np.array(bootstrap_curves)
+        ci_lower = np.nanpercentile(bootstrap_array, 2.5, axis=0)
+        ci_upper = np.nanpercentile(bootstrap_array, 97.5, axis=0)
+    else:
+        ci_lower = lowess_y
+        ci_upper = lowess_y
+
+    return lowess_x, lowess_y, ci_lower, ci_upper
+
+
 def plot_4_shap_dependence(shap_values, X_data, feature_cols, target_name, scaler=None, plot_dir=PLOT_DIR):
     """
-    为 SHAP 排名前 TOP_N_DEPENDENCE 个特征绘制依赖图。
-    SHAP 会自动选择交互最强的变量作为颜色编码。
+    为 SHAP 排名前 TOP_N_DEPENDENCE 个特征绘制增强版依赖图。
+    包含：散点图 + LOWESS 曲线 + Bootstrap 置信区间 + 阈值标注 + 背景分区。
     如果提供 scaler，则将横坐标还原为原始值（更直观）。
     """
-    log.info(f"绘制图4: SHAP单特征依赖图 — {target_name}")
+    log.info(f"绘制图4: SHAP单特征依赖图（LOWESS增强版）— {target_name}")
 
     # 按平均 |SHAP| 排序，取 Top N
     mean_abs_shap = np.abs(shap_values.values).mean(axis=0)
     top_indices = np.argsort(mean_abs_shap)[::-1][:TOP_N_DEPENDENCE]
     top_features = [feature_cols[i] for i in top_indices]
 
-    # 如果提供了 scaler，将 shap_values 中的 .data 替换为原始值
-    # 这样 shap.plots.scatter 的横坐标就会显示原始值
+    # 准备原始值数据（用于横坐标显示）
     if scaler is not None:
-        import copy
-        shap_values_plot = copy.deepcopy(shap_values)
-        shap_values_plot.data = scaler.inverse_transform(shap_values_plot.data)
+        X_display = scaler.inverse_transform(X_data)
     else:
-        shap_values_plot = shap_values
+        X_display = X_data
+
+    # 自动选择交互最强的特征作为颜色编码
+    # 使用 SHAP 内置的 approximate_interactions 方法
+    shap_vals_array = shap_values.values  # (n_samples, n_features)
 
     n_cols = 2
     n_rows = (len(top_features) + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 5 * n_rows))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7.5 * n_cols, 5.5 * n_rows))
     axes = axes.flatten()
 
     for idx, feat in enumerate(top_features):
         ax = axes[idx]
-        shap.plots.scatter(shap_values_plot[:, feat], color=shap_values_plot, show=False, ax=ax)
+        feat_idx = feature_cols.index(feat)
+
+        # 特征值和 SHAP 值
+        feat_vals = X_display[:, feat_idx]
+        shap_vals = shap_vals_array[:, feat_idx]
+
+        # 自动选择交互最强的特征（排除自身）
+        # 使用相关性方法：对每个其他特征，计算其值与当前特征 SHAP 值的相关性
+        best_interact_idx = None
+        best_interact_corr = -1
+        for j in range(len(feature_cols)):
+            if j == feat_idx:
+                continue
+            try:
+                corr = np.abs(np.corrcoef(X_display[:, j], shap_vals)[0, 1])
+                if not np.isnan(corr) and corr > best_interact_corr:
+                    best_interact_corr = corr
+                    best_interact_idx = j
+            except Exception:
+                continue
+
+        if best_interact_idx is not None:
+            color_vals = X_display[:, best_interact_idx]
+            color_feat_name = feature_cols[best_interact_idx]
+        else:
+            color_vals = feat_vals
+            color_feat_name = feat
+
+        # ---- 计算 LOWESS 拟合 + 置信区间 ----
+        lowess_x, lowess_y, ci_lower, ci_upper = _compute_lowess_with_ci(
+            feat_vals, shap_vals, frac=0.3, n_bootstrap=200
+        )
+
+        # ---- 找到 LOWESS 与 y=0 的交叉点 ----
+        crossings = _find_lowess_zero_crossings(lowess_x, lowess_y)
+
+        # ---- 绘图 ----
+        # 1. 背景分区（基于交叉点）
+        x_min, x_max = feat_vals.min(), feat_vals.max()
+        x_margin = (x_max - x_min) * 0.03
+        plot_xmin = x_min - x_margin
+        plot_xmax = x_max + x_margin
+
+        if len(crossings) > 0:
+            # 使用第一个交叉点进行分区
+            threshold = crossings[0]
+            # 判断交叉点左侧是正还是负（取 LOWESS 曲线在交叉点左侧的值）
+            left_mask = lowess_x < threshold
+            if np.any(left_mask):
+                left_sign = np.sign(lowess_y[left_mask][-1])
+            else:
+                left_sign = -1  # 默认左侧为负
+
+            if left_sign < 0:
+                # 左侧负（浅红），右侧正（浅蓝）
+                ax.axvspan(plot_xmin, threshold, color='#FFEBEE', alpha=0.4, zorder=0)
+                ax.axvspan(threshold, plot_xmax, color='#E3F2FD', alpha=0.4, zorder=0)
+            else:
+                # 左侧正（浅蓝），右侧负（浅红）
+                ax.axvspan(plot_xmin, threshold, color='#E3F2FD', alpha=0.4, zorder=0)
+                ax.axvspan(threshold, plot_xmax, color='#FFEBEE', alpha=0.4, zorder=0)
+        else:
+            # 无交叉点，根据 LOWESS 均值判断整体正负
+            if np.mean(lowess_y) >= 0:
+                ax.axvspan(plot_xmin, plot_xmax, color='#E3F2FD', alpha=0.3, zorder=0)
+            else:
+                ax.axvspan(plot_xmin, plot_xmax, color='#FFEBEE', alpha=0.3, zorder=0)
+
+        # 2. 散点图（颜色映射交互特征）
+        scatter = ax.scatter(feat_vals, shap_vals, c=color_vals, cmap='RdBu',
+                             alpha=0.5, s=12, edgecolors='none', zorder=2)
+
+        # 3. LOWESS 曲线
+        ax.plot(lowess_x, lowess_y, color='#1565C0', linewidth=2.5, zorder=4, label='LOWESS')
+
+        # 4. 置信区间
+        ax.fill_between(lowess_x, ci_lower, ci_upper, alpha=0.2, color='#1565C0', zorder=3,
+                         label='95% 置信区间')
+
+        # 5. y=0 水平虚线
+        ax.axhline(y=0, color='#1565C0', linestyle='--', linewidth=1, alpha=0.6, zorder=3)
+
+        # 6. 阈值标注（交叉点）
+        for cross_x in crossings:
+            ax.axvline(x=cross_x, color='#D32F2F', linestyle='--', linewidth=1.5, alpha=0.8, zorder=4)
+            # 在交叉点处标注数值
+            y_range = shap_vals.max() - shap_vals.min()
+            ax.annotate(f'{cross_x:.2f}',
+                        xy=(cross_x, 0),
+                        xytext=(cross_x, -y_range * 0.08),
+                        fontsize=9, fontweight='bold', color='#D32F2F',
+                        ha='center', va='top',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='#D32F2F'),
+                        zorder=5)
+
+        # 7. 颜色条
+        cbar = fig.colorbar(scatter, ax=ax, shrink=0.8, pad=0.02)
+        cbar.set_label(color_feat_name, fontsize=9)
+
+        # 8. 标签和标题
+        ax.set_xlabel(f'{feat}', fontsize=11)
+        ax.set_ylabel('SHAP value', fontsize=11)
         ax.set_title(f'{feat}', fontsize=12, fontweight='bold')
-        ax.grid(True, alpha=0.3)
+        ax.set_xlim(plot_xmin, plot_xmax)
+        ax.grid(True, alpha=0.2, zorder=1)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+        # 9. 图例（仅第一个子图显示）
+        if idx == 0:
+            ax.legend(loc='best', fontsize=8, framealpha=0.8)
 
     # 隐藏多余子图
     for idx in range(len(top_features), len(axes)):
