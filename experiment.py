@@ -3,7 +3,7 @@
 """
 步行活力与步行范围的多模型对比实验（改进版）
 =============================================
-模型A：Y = 短距步行比例 ~ f(X₁, X₂, ..., X₂₄)  → 解释"步行活力的形成"
+模型A：Y = 步行比例 ~ f(X₁, X₂, ..., X₂₄)  → 解释"步行活力的形成"
 模型B：Y = 步行距离     ~ f(X₁, X₂, ..., X₂₄)  → 解释"步行范围的限制"
 
 实验流程：
@@ -59,7 +59,7 @@ LOG_DIR = os.path.join(BASE_DIR, 'logs')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-TARGET_A = '短距步行比例'
+TARGET_A = '步行比例'
 TARGET_B = '步行距离'
 EXCLUDE_COLS = ['街区编号', TARGET_A, TARGET_B]
 
@@ -123,7 +123,7 @@ def log(msg=''):
 # ============ 数据加载与预处理 ============
 def load_data():
     """加载并预处理数据"""
-    df = pd.read_csv(DATA_PATH, encoding='gbk')
+    df = pd.read_csv(DATA_PATH, encoding='utf-8')
     log(f"数据维度: {df.shape}")
     log(f"列名: {df.columns.tolist()}")
 
@@ -193,17 +193,17 @@ def get_param_grids():
             'min_samples_leaf': [5, 10, 15, 20],         # 提高下限到5（原3过小）
             'max_features': ['sqrt', 0.3, 0.5, 0.7],    # 增加0.3，更多特征采样选择
         },
-        # XGBOOST: 扩展边界命中参数，细化正则化区域
-        # 原 n_estimators=300 两次命中上界，reg_lambda=1.0 两次命中下界
+        # XGBOOST: 扩展正则化上界（第3轮步行距离 reg_lambda=5.0/reg_alpha=1.0 命中上界）
+        #          learning_rate=0.01 命中下界，向下探索 0.005
         'XGBOOST': {
-            'n_estimators': [100, 200, 300, 500],        # 扩展上界
+            'n_estimators': [100, 200, 300, 500],        # 保持不变，范围合理
             'max_depth': [3, 4, 5, 6],                   # 保持不变，范围合理
-            'learning_rate': [0.01, 0.03, 0.05, 0.1],   # 细化中间区域
-            'subsample': [0.7, 0.8, 0.9, 1.0],          # 扩展上界
-            'colsample_bytree': [0.5, 0.6, 0.7, 0.8],   # 向下扩展（原0.6命中下界）
-            'reg_alpha': [0, 0.01, 0.1, 1.0],           # 细化低正则化区域
-            'reg_lambda': [0.1, 0.5, 1.0, 3.0, 5.0],   # 向下扩展（原1.0命中下界）
-            'min_child_weight': [3, 5, 10, 15],          # 增加15档位
+            'learning_rate': [0.005, 0.01, 0.03, 0.05, 0.1],  # 向下扩展（0.01命中下界）
+            'subsample': [0.7, 0.8, 0.9, 1.0],          # 保持不变，范围合理
+            'colsample_bytree': [0.5, 0.6, 0.7, 0.8],   # 保持不变，范围合理
+            'reg_alpha': [0, 0.01, 0.1, 0.5, 1.0, 3.0], # 扩展上界（1.0命中上界），补充0.5中间值
+            'reg_lambda': [0.1, 0.5, 1.0, 3.0, 5.0, 8.0, 10.0],  # 扩展上界（5.0命中上界）
+            'min_child_weight': [3, 5, 10, 15],          # 保持不变，范围合理
         },
         # LightGBM: 重点优化 lr与n_estimators耦合、正则化、num_leaves
         # 原 lr=0.01时n_estimators=300远不够（有效学习量仅3）
@@ -648,7 +648,7 @@ def main():
 
     # 3. 对两个因变量分别进行实验
     targets = {
-        TARGET_A: (y_a, '模型A：短距步行比例（步行活力的形成）'),
+TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
         TARGET_B: (y_b, '模型B：步行距离（步行范围的限制）')
     }
 
