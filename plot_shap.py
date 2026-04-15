@@ -755,53 +755,63 @@ def plot_4_shap_dependence(shap_values, X_data, feature_cols, target_name, scale
 # =====================================================================
 #  图5: 二维 PDP 部分依赖图
 # =====================================================================
-def plot_5_pdp_2d(model, X_train_scaled, feature_cols, target_name, scaler=None, plot_dir=PLOT_DIR):
+def plot_5_pdp_2d(model, X_train_scaled, feature_cols, target_name,
+                  shap_interaction=None, scaler=None, plot_dir=PLOT_DIR):
     """
-    基于 SHAP 交互强度自动选取 Top 变量对，绘制二维 PDP 热力图。
+    为每个变量找到与其 SHAP 交互最强的搭档，绘制二维 PDP 热力图。
+    每个变量一张图，保存到 plot_dir/图5_二维PDP/ 子目录中。
     如果提供 scaler，则将坐标轴还原为原始值。
     """
-    log.info(f"绘制图5: 二维PDP部分依赖图 — {target_name}")
+    log.info(f"绘制图5: 二维PDP部分依赖图（按最强交互配对）— {target_name}")
 
     theme = get_theme(target_name)
+    from sklearn.inspection import partial_dependence
 
-    # 使用 SHAP 重要性排名前 6 的特征，选取有意义的组合
-    explainer = shap.TreeExplainer(model)
-    shap_vals = explainer(pd.DataFrame(X_train_scaled, columns=feature_cols))
+    # 创建子目录
+    sub_dir = os.path.join(plot_dir, '图5_二维PDP')
+    os.makedirs(sub_dir, exist_ok=True)
+
+    n_features = len(feature_cols)
+
+    # ---- 计算每个变量的最强交互搭档 ----
+    if shap_interaction is not None:
+        # 使用传入的 SHAP 交互值
+        interaction_matrix = np.abs(shap_interaction).mean(axis=0)
+    else:
+        # 如果没有传入，自行计算
+        log.info("  未传入 shap_interaction，自行计算...")
+        explainer = shap.TreeExplainer(model)
+        shap_inter = explainer.shap_interaction_values(
+            pd.DataFrame(X_train_scaled, columns=feature_cols)
+        )
+        interaction_matrix = np.abs(shap_inter).mean(axis=0)
+
+    # 按 SHAP 重要性排序（用于文件名编号）
+    explainer_shap = shap.TreeExplainer(model)
+    shap_vals = explainer_shap(pd.DataFrame(X_train_scaled, columns=feature_cols))
     mean_abs_shap = np.abs(shap_vals.values).mean(axis=0)
-    top_indices = np.argsort(mean_abs_shap)[::-1][:6]
-    top_features = [feature_cols[i] for i in top_indices]
+    sorted_indices = np.argsort(mean_abs_shap)[::-1]
 
-    # 生成变量对（取前 N_PDP_PAIRS 对）
-    pairs = []
-    for i in range(len(top_features)):
-        for j in range(i + 1, len(top_features)):
-            pairs.append((top_features[i], top_features[j]))
-    pairs = pairs[:N_PDP_PAIRS]
+    # 为每个变量找到交互最强的搭档
+    total = n_features
+    for rank, feat_idx_a in enumerate(sorted_indices, start=1):
+        feat_a = feature_cols[feat_idx_a]
 
-    n_cols = 2
-    n_rows = (len(pairs) + n_cols - 1) // n_cols
+        # 找到与 feat_a 交互最强的变量（排除自身对角线）
+        inter_strengths = interaction_matrix[feat_idx_a].copy()
+        inter_strengths[feat_idx_a] = -1  # 排除自身
+        feat_idx_b = np.argmax(inter_strengths)
+        feat_b = feature_cols[feat_idx_b]
+        strength = inter_strengths[feat_idx_b]
 
-    # 使用 sklearn 的 PartialDependenceDisplay 逐对绘制
-    df_train = pd.DataFrame(X_train_scaled, columns=feature_cols)
+        log.info(f"  [{rank}/{total}] {feat_a} 的最强交互搭档: {feat_b} (强度={strength:.5f})")
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(8 * n_cols, 6 * n_rows))
-    if n_rows == 1:
-        axes = axes.reshape(1, -1)
-    axes_flat = axes.flatten()
-
-    for idx, (feat_a, feat_b) in enumerate(pairs):
-        ax = axes_flat[idx]
-        feat_idx_a = feature_cols.index(feat_a)
-        feat_idx_b = feature_cols.index(feat_b)
-
-        # 计算部分依赖
-        from sklearn.inspection import partial_dependence
+        # 计算二维偏依赖
         pd_result = partial_dependence(
             model, X_train_scaled, features=[(feat_idx_a, feat_idx_b)],
             kind='average', grid_resolution=30
         )
 
-        # 提取网格和预测值
         grid_a = pd_result['grid_values'][0]
         grid_b = pd_result['grid_values'][1]
 
@@ -815,31 +825,28 @@ def plot_5_pdp_2d(model, X_train_scaled, feature_cols, target_name, scaler=None,
         xx, yy = np.meshgrid(grid_a, grid_b)
         zz = pd_result['average'][0].T  # 转置以匹配 meshgrid
 
-        # 绘制热力图（填充等高线）
-        n_levels = 8  # 等高线层数，与参考图一致
+        # ---- 绘图 ----
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        n_levels = 8
         contour_filled = ax.contourf(xx, yy, zz, levels=n_levels, cmap=theme['cmap_diverging'], alpha=0.9)
-        # 绘制等高线（线条）
         contour_lines = ax.contour(xx, yy, zz, levels=contour_filled.levels, colors='white',
                                    linewidths=0.8, alpha=0.7)
-        # 在等高线上标注数值（大字体、加粗，参考示意图样式）
         clbl = ax.clabel(contour_lines, inline=True, fontsize=13, fmt='%.2f', colors='black')
         for txt in clbl:
             txt.set_fontweight('bold')
         fig.colorbar(contour_filled, ax=ax, shrink=0.8, label='部分依赖值')
-        ax.set_xlabel(feat_a, fontsize=11)
-        ax.set_ylabel(feat_b, fontsize=11)
-        ax.set_title(f'{feat_a} × {feat_b}', fontsize=12, fontweight='bold')
+        ax.set_xlabel(feat_a, fontsize=12)
+        ax.set_ylabel(feat_b, fontsize=12)
+        ax.set_title(f'{feat_a} × {feat_b}  (交互强度={strength:.5f})',
+                     fontsize=13, fontweight='bold')
 
-    # 隐藏多余子图
-    for idx in range(len(pairs), len(axes_flat)):
-        axes_flat[idx].set_visible(False)
+        plt.tight_layout()
+        save_path = os.path.join(sub_dir, f'{rank:02d}_{feat_a}×{feat_b}.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
 
-    fig.suptitle(f'{target_name} — 二维 PDP 部分依赖图', fontsize=15, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    save_path = os.path.join(plot_dir, f'图5_二维PDP_{target_name}.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    log.info(f"  已保存: {save_path}")
+    log.info(f"  图5全部完成，共 {total} 张图，保存于: {sub_dir}")
 
 
 # =====================================================================
@@ -1448,16 +1455,17 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
     if should_plot(4) and shap_values is not None:
         plot_4_shap_dependence(shap_values, X_train_scaled, feature_cols, target_name, scaler=scaler, plot_dir=target_plot_dir)
 
-    # ===== 图5: 二维 PDP =====
-    if should_plot(5):
-        plot_5_pdp_2d(shap_model, X_train_scaled, feature_cols, target_name, scaler=scaler, plot_dir=target_plot_dir)
-
-    # ===== 计算 SHAP 交互值（图6/7/8/12 共用） =====
+    # ===== 计算 SHAP 交互值（图5/6/7/8/12 共用） =====
     shap_interaction = None
-    if any(should_plot(n) for n in [6, 7, 8, 12]):
+    if any(should_plot(n) for n in [5, 6, 7, 8, 12]):
         shap_interaction = compute_shap_interaction_values(
             shap_model, X_train_scaled, feature_cols
         )
+
+    # ===== 图5: 二维 PDP =====
+    if should_plot(5):
+        plot_5_pdp_2d(shap_model, X_train_scaled, feature_cols, target_name,
+                      shap_interaction=shap_interaction, scaler=scaler, plot_dir=target_plot_dir)
 
     # ===== 图6: 交互效应矩阵 =====
     top_pairs = None
