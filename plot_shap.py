@@ -308,11 +308,216 @@ def compute_shap_interaction_values(model, X_data, feature_cols):
 # =====================================================================
 #  图1: 模型性能验证图（三联组合图）
 # =====================================================================
-def plot_1_model_performance(y_test, test_results, target_name, shap_model_name='XGBOOST', plot_dir=PLOT_DIR):
+def _plot_1a_r2_bar(test_results, target_name, shap_model_name, theme, save_path):
+    """图1(a): 多模型 R² 对比柱状图"""
+    fig, ax = plt.subplots(figsize=(7, 5.5))
+
+    model_names = list(test_results.keys())
+    r2_values = [test_results[m]['metrics']['R²'] for m in model_names]
+    colors = [MODEL_COLORS.get(m, '#95a5a6') for m in model_names]
+
+    bars = ax.bar(model_names, r2_values, color=colors, edgecolor='white', linewidth=0.8, width=0.6)
+    for i, m in enumerate(model_names):
+        if m == shap_model_name:
+            bars[i].set_edgecolor(theme['accent'])
+            bars[i].set_linewidth(2.5)
+
+    for bar, val in zip(bars, r2_values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                f'{val:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    ax.set_ylabel('R²', fontsize=12)
+    ax.set_title(f'{target_name} — 多模型 R² 对比', fontsize=13, fontweight='bold')
+    ax.set_ylim(0, max(r2_values) * 1.15)
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _plot_1b_joint(y_test, y_pred_test, y_train, y_pred_train, has_train,
+                   shap_model_name, target_name, save_path):
+    """图1(b): 最优模型 Joint Plot（带边际分布的散点图 + 底部残差图）"""
+    from scipy.stats import gaussian_kde
+    from matplotlib.gridspec import GridSpec
+
+    train_color = '#6C8EBF'
+    test_color = '#D4726A'
+
+    if has_train:
+        all_actual = np.concatenate([y_train, y_test])
+        all_pred = np.concatenate([y_pred_train, y_pred_test])
+    else:
+        all_actual = y_test
+        all_pred = y_pred_test
+
+    # 计算指标
+    r2_test = r2_score(y_test, y_pred_test)
+    rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test))
+    mae_test = mean_absolute_error(y_test, y_pred_test)
+    if has_train:
+        r2_train = r2_score(y_train, y_pred_train)
+        rmse_train = np.sqrt(mean_squared_error(y_train, y_pred_train))
+        mae_train = mean_absolute_error(y_train, y_pred_train)
+
+    # 坐标范围
+    lims = [min(all_actual.min(), all_pred.min()), max(all_actual.max(), all_pred.max())]
+    margin = (lims[1] - lims[0]) * 0.05
+    lims = [lims[0] - margin, lims[1] + margin]
+
+    fig = plt.figure(figsize=(8, 8))
+    gs = GridSpec(3, 2, figure=fig,
+                  height_ratios=[0.8, 3, 1.2], width_ratios=[3, 0.8],
+                  hspace=0.08, wspace=0.08)
+
+    ax_top = fig.add_subplot(gs[0, 0])
+    ax_main = fig.add_subplot(gs[1, 0])
+    ax_right = fig.add_subplot(gs[1, 1])
+    ax_resid = fig.add_subplot(gs[2, 0])
+    ax_empty1 = fig.add_subplot(gs[0, 1])
+    ax_empty2 = fig.add_subplot(gs[2, 1])
+    ax_empty1.axis('off')
+    ax_empty2.axis('off')
+
+    # --- 主散点图 ---
+    if has_train:
+        ax_main.scatter(y_train, y_pred_train, alpha=0.3, s=14, color=train_color,
+                        edgecolors='none', label='Train data', zorder=2)
+    ax_main.scatter(y_test, y_pred_test, alpha=0.4, s=14, color=test_color,
+                    edgecolors='none', label='Test data', zorder=3)
+
+    # 拟合线
+    coeffs = np.polyfit(all_actual, all_pred, 1)
+    fit_x = np.linspace(lims[0], lims[1], 100)
+    fit_y = np.polyval(coeffs, fit_x)
+    ax_main.plot(fit_x, fit_y, 'k-', linewidth=1.8, label='Fitted line', zorder=4)
+
+    # 45° 参考虚线
+    ax_main.plot(lims, lims, 'k--', linewidth=1, alpha=0.5, zorder=1)
+
+    ax_main.set_xlim(lims)
+    ax_main.set_ylim(lims)
+    ax_main.set_aspect('equal')
+
+    # 标注 R² 和 RMSE
+    if has_train:
+        stats_text = (f'Train $R^2$ = {r2_train:.2f}, $RMSE$ = {rmse_train:.2f}\n'
+                      f'Test $R^2$ = {r2_test:.2f}, $RMSE$ = {rmse_test:.2f}')
+    else:
+        stats_text = f'Test $R^2$ = {r2_test:.2f}, $RMSE$ = {rmse_test:.2f}'
+    ax_main.text(0.05, 0.95, stats_text, transform=ax_main.transAxes,
+                 fontsize=10, fontweight='bold', va='top',
+                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+
+    ax_main.set_title(f'{target_name} — {shap_model_name}', fontsize=13, fontweight='bold')
+    ax_main.legend(loc='center right', fontsize=8, framealpha=0.8)
+    ax_main.grid(True, alpha=0.15)
+    ax_main.tick_params(labelbottom=False)
+
+    # --- 顶部边际直方图 ---
+    bins_x = np.linspace(lims[0], lims[1], 35)
+    if has_train:
+        ax_top.hist(y_train, bins=bins_x, alpha=0.5, color=train_color,
+                    edgecolor='white', linewidth=0.3, density=True)
+    ax_top.hist(y_test, bins=bins_x, alpha=0.5, color=test_color,
+                edgecolor='white', linewidth=0.3, density=True)
+    x_kde = np.linspace(lims[0], lims[1], 200)
+    if has_train:
+        kde_train_x = gaussian_kde(y_train)
+        ax_top.plot(x_kde, kde_train_x(x_kde), color=train_color, linewidth=1.5)
+    kde_test_x = gaussian_kde(y_test)
+    ax_top.plot(x_kde, kde_test_x(x_kde), color=test_color, linewidth=1.5)
+
+    ax_top.set_xlim(lims)
+    ax_top.tick_params(labelbottom=False, labelleft=False)
+    ax_top.spines['top'].set_visible(False)
+    ax_top.spines['right'].set_visible(False)
+    ax_top.spines['left'].set_visible(False)
+
+    # --- 右侧边际直方图 ---
+    bins_y = np.linspace(lims[0], lims[1], 35)
+    if has_train:
+        ax_right.hist(y_pred_train, bins=bins_y, alpha=0.5, color=train_color,
+                      edgecolor='white', linewidth=0.3, density=True,
+                      orientation='horizontal')
+    ax_right.hist(y_pred_test, bins=bins_y, alpha=0.5, color=test_color,
+                  edgecolor='white', linewidth=0.3, density=True,
+                  orientation='horizontal')
+    y_kde = np.linspace(lims[0], lims[1], 200)
+    if has_train:
+        kde_train_y = gaussian_kde(y_pred_train)
+        ax_right.plot(kde_train_y(y_kde), y_kde, color=train_color, linewidth=1.5)
+    kde_test_y = gaussian_kde(y_pred_test)
+    ax_right.plot(kde_test_y(y_kde), y_kde, color=test_color, linewidth=1.5)
+
+    ax_right.set_ylim(lims)
+    ax_right.tick_params(labelbottom=False, labelleft=False)
+    ax_right.spines['top'].set_visible(False)
+    ax_right.spines['right'].set_visible(False)
+    ax_right.spines['bottom'].set_visible(False)
+
+    # --- 底部残差图 ---
+    resid_test = y_test - y_pred_test
+    ax_resid.scatter(y_test, resid_test, alpha=0.3, s=10, color=test_color,
+                     edgecolors='none', zorder=2)
+    if has_train:
+        resid_train = y_train - y_pred_train
+        ax_resid.scatter(y_train, resid_train, alpha=0.2, s=10, color=train_color,
+                         edgecolors='none', zorder=1)
+
+    ax_resid.axhline(y=0, color='k', linewidth=1, zorder=3)
+    ax_resid.set_xlim(lims)
+
+    if has_train:
+        mae_text = f'MAE (Train) = {mae_train:.3f}\nMAE (Test) = {mae_test:.3f}'
+    else:
+        mae_text = f'MAE (Test) = {mae_test:.3f}'
+    ax_resid.text(0.98, 0.95, mae_text, transform=ax_resid.transAxes,
+                  fontsize=9, fontweight='bold', va='top', ha='right',
+                  bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+    ax_resid.grid(True, alpha=0.15)
+
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _plot_1c_residual_hist(y_test, y_pred_test, shap_model_name, target_name,
+                           model_color, save_path):
+    """图1(c): 最优模型 残差直方图"""
+    from scipy.stats import norm
+
+    fig, ax = plt.subplots(figsize=(7, 5.5))
+
+    residuals = y_test - y_pred_test
+    ax.hist(residuals, bins=40, color=model_color, alpha=0.7, edgecolor='white', linewidth=0.5,
+            density=True)
+    mu, std = norm.fit(residuals)
+    x_range = np.linspace(residuals.min(), residuals.max(), 200)
+    ax.plot(x_range, norm.pdf(x_range, mu, std), 'k-', linewidth=1.5,
+            label=f'正态拟合 (μ={mu:.3f}, σ={std:.3f})')
+    ax.axvline(x=0, color='gray', linestyle='--', linewidth=1, alpha=0.7)
+    ax.set_xlabel('残差 (实际值 - 预测值)', fontsize=12)
+    ax.set_ylabel('密度', fontsize=12)
+    ax.set_title(f'{target_name} — {shap_model_name} 残差分布', fontsize=13, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_1_model_performance(y_test, test_results, target_name, shap_model_name='XGBOOST',
+                             y_train=None, train_preds=None, plot_dir=PLOT_DIR):
     """
-    三联组合图：
+    模型性能验证图，拆分为3张独立图片保存到子目录：
     (a) 多模型 R² 对比柱状图
-    (b) 最优模型 预测值 vs 实际值散点图
+    (b) 最优模型 Joint Plot（带边际分布的散点图 + 底部残差图）
     (c) 最优模型 残差直方图
     """
     log.info(f"绘制图1: 模型性能验证图 — {target_name}（SHAP模型: {shap_model_name}）")
@@ -320,80 +525,33 @@ def plot_1_model_performance(y_test, test_results, target_name, shap_model_name=
     theme = get_theme(target_name)
     model_color = MODEL_COLORS.get(shap_model_name, '#e74c3c')
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+    # 创建子目录
+    sub_dir = os.path.join(plot_dir, '图1_模型性能验证')
+    os.makedirs(sub_dir, exist_ok=True)
 
-    # --- (a) 多模型 R² 对比柱状图 ---
-    ax = axes[0]
-    model_names = list(test_results.keys())
-    r2_values = [test_results[m]['metrics']['R²'] for m in model_names]
-    colors = [MODEL_COLORS.get(m, '#95a5a6') for m in model_names]
+    # 准备 Joint Plot 所需数据
+    y_pred_test = test_results[shap_model_name]['y_pred']
+    has_train = y_train is not None and train_preds is not None and shap_model_name in train_preds
+    y_pred_train = train_preds[shap_model_name] if has_train else None
 
-    bars = ax.bar(model_names, r2_values, color=colors, edgecolor='white', linewidth=0.8, width=0.6)
-    # 高亮 SHAP 分析所用的模型
-    for i, m in enumerate(model_names):
-        if m == shap_model_name:
-            bars[i].set_edgecolor(theme['accent'])
-            bars[i].set_linewidth(2.5)
+    # (a) 多模型 R² 对比柱状图
+    save_a = os.path.join(sub_dir, '01_R2对比.png')
+    _plot_1a_r2_bar(test_results, target_name, shap_model_name, theme, save_a)
+    log.info(f"  已保存: {save_a}")
 
-    # 在柱子上方标注数值
-    for bar, val in zip(bars, r2_values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
-                f'{val:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    # (b) Joint Plot
+    save_b = os.path.join(sub_dir, f'02_JointPlot_{shap_model_name}.png')
+    _plot_1b_joint(y_test, y_pred_test, y_train, y_pred_train, has_train,
+                   shap_model_name, target_name, save_b)
+    log.info(f"  已保存: {save_b}")
 
-    ax.set_ylabel('R²', fontsize=12)
-    ax.set_title('(a) 多模型 R² 对比', fontsize=13, fontweight='bold')
-    ax.set_ylim(0, max(r2_values) * 1.15)
-    ax.grid(True, alpha=0.3, axis='y')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
+    # (c) 残差直方图
+    save_c = os.path.join(sub_dir, f'03_残差分布_{shap_model_name}.png')
+    _plot_1c_residual_hist(y_test, y_pred_test, shap_model_name, target_name,
+                           model_color, save_c)
+    log.info(f"  已保存: {save_c}")
 
-    # --- (b) 最优模型 预测值 vs 实际值散点图 ---
-    ax = axes[1]
-    y_pred_best = test_results[shap_model_name]['y_pred']
-    ax.scatter(y_test, y_pred_best, alpha=0.35, s=12, color=model_color, edgecolors='none')
-    # 45° 参考线
-    lims = [min(y_test.min(), y_pred_best.min()), max(y_test.max(), y_pred_best.max())]
-    margin = (lims[1] - lims[0]) * 0.05
-    lims = [lims[0] - margin, lims[1] + margin]
-    ax.plot(lims, lims, 'k--', linewidth=1, alpha=0.7, label='理想预测线 (y=x)')
-    ax.set_xlim(lims)
-    ax.set_ylim(lims)
-    ax.set_xlabel('实际值', fontsize=12)
-    ax.set_ylabel('预测值', fontsize=12)
-    ax.set_title(f'(b) {shap_model_name} 预测值 vs 实际值', fontsize=13, fontweight='bold')
-    r2_best = test_results[shap_model_name]['metrics']['R²']
-    ax.text(0.05, 0.92, f'R²={r2_best:.4f}', transform=ax.transAxes,
-            fontsize=11, fontweight='bold', color=model_color,
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
-    ax.legend(loc='lower right', fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.set_aspect('equal')
-
-    # --- (c) 最优模型 残差直方图 ---
-    ax = axes[2]
-    residuals = y_test - y_pred_best
-    ax.hist(residuals, bins=40, color=model_color, alpha=0.7, edgecolor='white', linewidth=0.5,
-            density=True)
-    # 叠加正态分布曲线
-    from scipy.stats import norm
-    mu, std = norm.fit(residuals)
-    x_range = np.linspace(residuals.min(), residuals.max(), 200)
-    ax.plot(x_range, norm.pdf(x_range, mu, std), 'k-', linewidth=1.5, label=f'正态拟合 (μ={mu:.3f}, σ={std:.3f})')
-    ax.axvline(x=0, color='gray', linestyle='--', linewidth=1, alpha=0.7)
-    ax.set_xlabel('残差 (实际值 - 预测值)', fontsize=12)
-    ax.set_ylabel('密度', fontsize=12)
-    ax.set_title(f'(c) {shap_model_name} 残差分布', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-    fig.suptitle(f'{target_name} — 模型性能验证', fontsize=15, fontweight='bold', y=1.03)
-    plt.tight_layout()
-    save_path = os.path.join(plot_dir, f'图1_模型性能验证_{target_name}.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    log.info(f"  已保存: {save_path}")
+    log.info(f"  图1全部完成，共 3 张图，保存于: {sub_dir}")
 
 
 # =====================================================================
@@ -410,6 +568,9 @@ def plot_2_shap_bar(shap_values, feature_cols, target_name, plot_dir=PLOT_DIR):
     # 将条形图颜色统一为主题色
     for patch in ax.patches:
         patch.set_facecolor(theme['bar_importance'])
+    # 移除条形图上的数字标注
+    for txt in ax.texts:
+        txt.remove()
     ax.set_title(f'{target_name} — SHAP 全局特征贡献', fontsize=14, fontweight='bold')
     plt.tight_layout()
     save_path = os.path.join(plot_dir, f'图2_SHAP特征贡献_{target_name}.png')
@@ -492,20 +653,84 @@ def _compute_lowess_with_ci(feat_vals, shap_vals, frac=0.3, n_bootstrap=200):
     return lowess_x, lowess_y, ci_lower, ci_upper
 
 
+def _plot_single_dependence(feat, feat_vals, shap_vals, theme, target_name, save_path):
+    """
+    为单个特征绘制 SHAP 依赖图（散点 + LOWESS + 内嵌柱状分布）。
+    柱状分布以灰色背景直方图形式嵌入散点图底部，无背景分区，无阈值标注。
+    """
+    fig, ax = plt.subplots(figsize=(7.5, 5.5))
+
+    # ---- 计算 LOWESS 拟合 + 置信区间 ----
+    lowess_x, lowess_y, ci_lower, ci_upper = _compute_lowess_with_ci(
+        feat_vals, shap_vals, frac=0.3, n_bootstrap=200
+    )
+
+    # ---- 坐标范围 ----
+    x_min, x_max = feat_vals.min(), feat_vals.max()
+    x_margin = (x_max - x_min) * 0.03
+    plot_xmin = x_min - x_margin
+    plot_xmax = x_max + x_margin
+
+    # 1. 内嵌柱状分布（灰色，贴在散点图底部，使用副轴）
+    ax_hist = ax.twinx()
+    n_bins = min(30, max(10, len(feat_vals) // 10))
+    ax_hist.hist(feat_vals, bins=n_bins, color='#C0C0C0', alpha=0.35,
+                 edgecolor='white', linewidth=0.3, zorder=0)
+    # 将柱状图压缩到底部约 25% 的区域
+    hist_ymax = ax_hist.get_ylim()[1]
+    ax_hist.set_ylim(0, hist_ymax * 4)
+    ax_hist.set_yticks([])
+    ax_hist.spines['top'].set_visible(False)
+    ax_hist.spines['right'].set_visible(False)
+    ax_hist.spines['left'].set_visible(False)
+    ax_hist.spines['bottom'].set_visible(False)
+
+    # 2. 散点图（单一颜色）
+    ax.scatter(feat_vals, shap_vals, color=theme['primary'],
+               alpha=0.35, s=14, edgecolors='none', zorder=2)
+
+    # 3. LOWESS 曲线（使用强调色，与散点区分）
+    ax.plot(lowess_x, lowess_y, color=theme['accent'], linewidth=2.5, zorder=4, label='LOWESS')
+
+    # 4. 置信区间
+    ax.fill_between(lowess_x, ci_lower, ci_upper, alpha=0.2, color=theme['accent'], zorder=3,
+                    label='95% 置信区间')
+
+    # 5. y=0 水平虚线
+    ax.axhline(y=0, color=theme['primary'], linestyle='--', linewidth=1, alpha=0.6, zorder=3)
+
+    ax.set_xlabel(f'{feat}', fontsize=11)
+    ax.set_ylabel(f'SHAP value for\n{feat}', fontsize=11)
+    ax.set_xlim(plot_xmin, plot_xmax)
+    ax.grid(True, alpha=0.2, zorder=1)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.legend(loc='best', fontsize=8, framealpha=0.8)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
 def plot_4_shap_dependence(shap_values, X_data, feature_cols, target_name, scaler=None, plot_dir=PLOT_DIR):
     """
-    为 SHAP 排名前 TOP_N_DEPENDENCE 个特征绘制增强版依赖图。
-    包含：散点图 + LOWESS 曲线 + Bootstrap 置信区间 + 阈值标注 + 背景分区。
+    为所有自变量绘制增强版 SHAP 依赖图，每个特征单独一张图。
+    每张图包含：上方散点图 + LOWESS 曲线 + Bootstrap 置信区间 + 阈值标注 + 背景分区，
+    下方为特征值的柱状分布图。
+    所有图保存到 plot_dir/图4_SHAP依赖图/ 子目录中。
     如果提供 scaler，则将横坐标还原为原始值（更直观）。
     """
-    log.info(f"绘制图4: SHAP单特征依赖图（LOWESS增强版）— {target_name}")
+    log.info(f"绘制图4: SHAP单特征依赖图（LOWESS增强版 + 柱状分布）— {target_name}")
 
     theme = get_theme(target_name)
 
-    # 按平均 |SHAP| 排序，取 Top N
+    # 创建子目录
+    sub_dir = os.path.join(plot_dir, '图4_SHAP依赖图')
+    os.makedirs(sub_dir, exist_ok=True)
+
+    # 按平均 |SHAP| 排序（用于文件名编号，方便按重要性排列）
     mean_abs_shap = np.abs(shap_values.values).mean(axis=0)
-    top_indices = np.argsort(mean_abs_shap)[::-1][:TOP_N_DEPENDENCE]
-    top_features = [feature_cols[i] for i in top_indices]
+    sorted_indices = np.argsort(mean_abs_shap)[::-1]
 
     # 准备原始值数据（用于横坐标显示）
     if scaler is not None:
@@ -513,140 +738,18 @@ def plot_4_shap_dependence(shap_values, X_data, feature_cols, target_name, scale
     else:
         X_display = X_data
 
-    # 自动选择交互最强的特征作为颜色编码
-    # 使用 SHAP 内置的 approximate_interactions 方法
     shap_vals_array = shap_values.values  # (n_samples, n_features)
 
-    n_cols = 2
-    n_rows = (len(top_features) + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7.5 * n_cols, 5.5 * n_rows))
-    axes = axes.flatten()
-
-    for idx, feat in enumerate(top_features):
-        ax = axes[idx]
-        feat_idx = feature_cols.index(feat)
-
-        # 特征值和 SHAP 值
+    for rank, feat_idx in enumerate(sorted_indices, start=1):
+        feat = feature_cols[feat_idx]
         feat_vals = X_display[:, feat_idx]
         shap_vals = shap_vals_array[:, feat_idx]
 
-        # 自动选择交互最强的特征（排除自身）
-        # 使用相关性方法：对每个其他特征，计算其值与当前特征 SHAP 值的相关性
-        best_interact_idx = None
-        best_interact_corr = -1
-        for j in range(len(feature_cols)):
-            if j == feat_idx:
-                continue
-            try:
-                corr = np.abs(np.corrcoef(X_display[:, j], shap_vals)[0, 1])
-                if not np.isnan(corr) and corr > best_interact_corr:
-                    best_interact_corr = corr
-                    best_interact_idx = j
-            except Exception:
-                continue
+        save_path = os.path.join(sub_dir, f'{rank:02d}_{feat}.png')
+        _plot_single_dependence(feat, feat_vals, shap_vals, theme, target_name, save_path)
+        log.info(f"  [{rank}/{len(feature_cols)}] 已保存: {save_path}")
 
-        if best_interact_idx is not None:
-            color_vals = X_display[:, best_interact_idx]
-            color_feat_name = feature_cols[best_interact_idx]
-        else:
-            color_vals = feat_vals
-            color_feat_name = feat
-
-        # ---- 计算 LOWESS 拟合 + 置信区间 ----
-        lowess_x, lowess_y, ci_lower, ci_upper = _compute_lowess_with_ci(
-            feat_vals, shap_vals, frac=0.3, n_bootstrap=200
-        )
-
-        # ---- 找到 LOWESS 与 y=0 的交叉点 ----
-        crossings = _find_lowess_zero_crossings(lowess_x, lowess_y)
-
-        # ---- 绘图 ----
-        # 1. 背景分区（基于交叉点）
-        x_min, x_max = feat_vals.min(), feat_vals.max()
-        x_margin = (x_max - x_min) * 0.03
-        plot_xmin = x_min - x_margin
-        plot_xmax = x_max + x_margin
-
-        if len(crossings) > 0:
-            # 使用第一个交叉点进行分区
-            threshold = crossings[0]
-            # 判断交叉点左侧是正还是负（取 LOWESS 曲线在交叉点左侧的值）
-            left_mask = lowess_x < threshold
-            if np.any(left_mask):
-                left_sign = np.sign(lowess_y[left_mask][-1])
-            else:
-                left_sign = -1  # 默认左侧为负
-
-            if left_sign < 0:
-                # 左侧负，右侧正
-                ax.axvspan(plot_xmin, threshold, color=theme['bg_negative'], alpha=0.4, zorder=0)
-                ax.axvspan(threshold, plot_xmax, color=theme['bg_positive'], alpha=0.4, zorder=0)
-            else:
-                # 左侧正，右侧负
-                ax.axvspan(plot_xmin, threshold, color=theme['bg_positive'], alpha=0.4, zorder=0)
-                ax.axvspan(threshold, plot_xmax, color=theme['bg_negative'], alpha=0.4, zorder=0)
-        else:
-            # 无交叉点，根据 LOWESS 均值判断整体正负
-            if np.mean(lowess_y) >= 0:
-                ax.axvspan(plot_xmin, plot_xmax, color=theme['bg_positive'], alpha=0.3, zorder=0)
-            else:
-                ax.axvspan(plot_xmin, plot_xmax, color=theme['bg_negative'], alpha=0.3, zorder=0)
-
-        # 2. 散点图（颜色映射交互特征）
-        scatter = ax.scatter(feat_vals, shap_vals, c=color_vals, cmap=theme['cmap_diverging'],
-                             alpha=0.5, s=12, edgecolors='none', zorder=2)
-
-        # 3. LOWESS 曲线
-        ax.plot(lowess_x, lowess_y, color=theme['primary'], linewidth=2.5, zorder=4, label='LOWESS')
-
-        # 4. 置信区间
-        ax.fill_between(lowess_x, ci_lower, ci_upper, alpha=0.2, color=theme['primary'], zorder=3,
-                         label='95% 置信区间')
-
-        # 5. y=0 水平虚线
-        ax.axhline(y=0, color=theme['primary'], linestyle='--', linewidth=1, alpha=0.6, zorder=3)
-
-        # 6. 阈值标注（交叉点）
-        for cross_x in crossings:
-            ax.axvline(x=cross_x, color=theme['accent'], linestyle='--', linewidth=1.5, alpha=0.8, zorder=4)
-            # 在交叉点处标注数值
-            y_range = shap_vals.max() - shap_vals.min()
-            ax.annotate(f'{cross_x:.2f}',
-                        xy=(cross_x, 0),
-                        xytext=(cross_x, -y_range * 0.08),
-                        fontsize=9, fontweight='bold', color=theme['accent'],
-                        ha='center', va='top',
-                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor=theme['accent']),
-                        zorder=5)
-
-        # 7. 颜色条
-        cbar = fig.colorbar(scatter, ax=ax, shrink=0.8, pad=0.02)
-        cbar.set_label(color_feat_name, fontsize=9)
-
-        # 8. 标签和标题
-        ax.set_xlabel(f'{feat}', fontsize=11)
-        ax.set_ylabel('SHAP value', fontsize=11)
-        ax.set_title(f'{feat}', fontsize=12, fontweight='bold')
-        ax.set_xlim(plot_xmin, plot_xmax)
-        ax.grid(True, alpha=0.2, zorder=1)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-
-        # 9. 图例（仅第一个子图显示）
-        if idx == 0:
-            ax.legend(loc='best', fontsize=8, framealpha=0.8)
-
-    # 隐藏多余子图
-    for idx in range(len(top_features), len(axes)):
-        axes[idx].set_visible(False)
-
-    fig.suptitle(f'{target_name} — SHAP 单特征依赖图 (Top {TOP_N_DEPENDENCE})',
-                 fontsize=15, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    save_path = os.path.join(plot_dir, f'图4_SHAP依赖图_{target_name}.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    log.info(f"  已保存: {save_path}")
+    log.info(f"  图4全部完成，共 {len(feature_cols)} 张图，保存于: {sub_dir}")
 
 
 # =====================================================================
@@ -712,9 +815,17 @@ def plot_5_pdp_2d(model, X_train_scaled, feature_cols, target_name, scaler=None,
         xx, yy = np.meshgrid(grid_a, grid_b)
         zz = pd_result['average'][0].T  # 转置以匹配 meshgrid
 
-        # 绘制热力图
-        contour = ax.contourf(xx, yy, zz, levels=20, cmap=theme['cmap_diverging'], alpha=0.9)
-        fig.colorbar(contour, ax=ax, shrink=0.8, label='部分依赖值')
+        # 绘制热力图（填充等高线）
+        n_levels = 8  # 等高线层数，与参考图一致
+        contour_filled = ax.contourf(xx, yy, zz, levels=n_levels, cmap=theme['cmap_diverging'], alpha=0.9)
+        # 绘制等高线（线条）
+        contour_lines = ax.contour(xx, yy, zz, levels=contour_filled.levels, colors='white',
+                                   linewidths=0.8, alpha=0.7)
+        # 在等高线上标注数值（大字体、加粗，参考示意图样式）
+        clbl = ax.clabel(contour_lines, inline=True, fontsize=13, fmt='%.2f', colors='black')
+        for txt in clbl:
+            txt.set_fontweight('bold')
+        fig.colorbar(contour_filled, ax=ax, shrink=0.8, label='部分依赖值')
         ax.set_xlabel(feat_a, fontsize=11)
         ax.set_ylabel(feat_b, fontsize=11)
         ax.set_title(f'{feat_a} × {feat_b}', fontsize=12, fontweight='bold')
@@ -875,32 +986,28 @@ def plot_7_main_vs_interaction(shap_values, shap_interaction, feature_cols, targ
 def plot_8_interaction_scatter(shap_interaction, X_data, feature_cols, target_name,
                                top_pairs=None, scaler=None, plot_dir=PLOT_DIR):
     """
-    为交互最强的 Top 3 对绘制 SHAP 交互散点图。
+    为交互最强的 Top 5 变量对绘制 SHAP 交互散点图，每对单独一张图。
     横轴=变量A的值，纵轴=A与B的SHAP交互值，颜色=变量B的值。
     如果提供 scaler，则将横轴和颜色编码还原为原始值。
+    所有图保存到 plot_dir/图8_交互散点图/ 子目录中，按交互强度排名编号。
     """
-    log.info(f"绘制图8: SHAP成对交互散点图 — {target_name}")
+    log.info(f"绘制图8: SHAP成对交互散点图（Top 5）— {target_name}")
 
     theme = get_theme(target_name)
 
-    if top_pairs is None:
-        # 自动计算 Top 3 交互对
-        n_features = len(feature_cols)
-        pairs_strength = []
-        for i in range(n_features):
-            for j in range(i + 1, n_features):
-                val = np.abs(shap_interaction[:, i, j]).mean()
-                pairs_strength.append((i, j, val))
-        pairs_strength.sort(key=lambda x: x[2], reverse=True)
-        top_pairs = pairs_strength[:3]
-    else:
-        # 将特征名转为索引
-        converted = []
-        for f1, f2, val in top_pairs[:3]:
-            i = feature_cols.index(f1)
-            j = feature_cols.index(f2)
-            converted.append((i, j, val))
-        top_pairs = converted
+    # 创建子目录
+    sub_dir = os.path.join(plot_dir, '图8_交互散点图')
+    os.makedirs(sub_dir, exist_ok=True)
+
+    # 计算所有变量对的交互强度并排序
+    n_features = len(feature_cols)
+    pairs_strength = []
+    for i in range(n_features):
+        for j in range(i + 1, n_features):
+            val = np.abs(shap_interaction[:, i, j]).mean()
+            pairs_strength.append((i, j, val))
+    pairs_strength.sort(key=lambda x: x[2], reverse=True)
+    pairs_strength = pairs_strength[:5]  # 只取 Top 5 交互对
 
     # 如果提供了 scaler，将特征值反标准化为原始值
     if scaler is not None:
@@ -908,14 +1015,12 @@ def plot_8_interaction_scatter(shap_interaction, X_data, feature_cols, target_na
     else:
         X_display = X_data
 
-    fig, axes = plt.subplots(1, len(top_pairs), figsize=(7 * len(top_pairs), 5.5))
-    if len(top_pairs) == 1:
-        axes = [axes]
-
-    for idx, (i, j, strength) in enumerate(top_pairs):
-        ax = axes[idx]
+    total = len(pairs_strength)
+    for rank, (i, j, strength) in enumerate(pairs_strength, start=1):
         feat_a = feature_cols[i]
         feat_b = feature_cols[j]
+
+        fig, ax = plt.subplots(figsize=(7, 5.5))
 
         # SHAP 交互值
         interaction_vals = shap_interaction[:, i, j]
@@ -923,22 +1028,27 @@ def plot_8_interaction_scatter(shap_interaction, X_data, feature_cols, target_na
         color_vals = X_display[:, j]
 
         scatter = ax.scatter(x_vals, interaction_vals, c=color_vals, cmap=theme['cmap_diverging'],
-                             alpha=0.5, s=10, edgecolors='none')
+                             alpha=0.5, s=14, edgecolors='none')
         ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
         ax.set_xlabel(feat_a, fontsize=11)
         ax.set_ylabel(f'SHAP 交互值\n({feat_a} × {feat_b})', fontsize=10)
-        ax.set_title(f'{feat_a} × {feat_b}\n(强度={strength:.5f})', fontsize=11, fontweight='bold')
+        ax.set_title(f'{target_name} — {feat_a} × {feat_b}\n(交互强度={strength:.5f})',
+                     fontsize=12, fontweight='bold')
         ax.grid(True, alpha=0.3)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
         cbar = fig.colorbar(scatter, ax=ax, shrink=0.8)
         cbar.set_label(feat_b, fontsize=9)
 
-    fig.suptitle(f'{target_name} — SHAP 成对交互散点图 (Top 3)',
-                 fontsize=15, fontweight='bold', y=1.03)
-    plt.tight_layout()
-    save_path = os.path.join(plot_dir, f'图8_交互散点图_{target_name}.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    log.info(f"  已保存: {save_path}")
+        plt.tight_layout()
+        save_path = os.path.join(sub_dir, f'{rank:03d}_{feat_a}×{feat_b}.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        if rank <= 5 or rank == total:
+            log.info(f"  [{rank}/{total}] 已保存: {save_path}")
+
+    log.info(f"  图8完成，共 {total} 张图（Top 5），保存于: {sub_dir}")
 
 
 # =====================================================================
@@ -965,41 +1075,43 @@ def plot_9_shap_heatmap(shap_values, feature_cols, target_name, plot_dir=PLOT_DI
 # =====================================================================
 def plot_10_residuals(y_test, test_results, target_name, plot_dir=PLOT_DIR):
     """
-    绘制所有模型的残差图（子图排列）。
+    为每个模型单独绘制残差图，保存到 plot_dir/图10_残差图/ 子目录中。
     从 experiment.py 迁移而来。
     """
-    log.info(f"绘制图10: 各模型残差图 — {target_name}")
+    log.info(f"绘制图10: 各模型残差图（拆分版）— {target_name}")
 
     theme = get_theme(target_name)
 
+    # 创建子目录
+    sub_dir = os.path.join(plot_dir, '图10_残差图')
+    os.makedirs(sub_dir, exist_ok=True)
+
     model_names = list(test_results.keys())
-    n_models = len(model_names)
-
-    fig, axes = plt.subplots(1, n_models, figsize=(5 * n_models, 4.5), sharey=True)
-    if n_models == 1:
-        axes = [axes]
-
-    colors_list = ['#7f8c8d', '#3498db', '#2ecc71', '#e74c3c', '#9b59b6']
 
     for idx, name in enumerate(model_names):
-        ax = axes[idx]
+        fig, ax = plt.subplots(figsize=(6, 5))
+
         y_pred = test_results[name]['y_pred']
         residuals = y_test - y_pred
-        ax.scatter(y_pred, residuals, alpha=0.3, s=10,
-                   color=colors_list[idx % len(colors_list)], edgecolors='none')
+        model_color = MODEL_COLORS.get(name, '#3498db')
+
+        ax.scatter(y_pred, residuals, alpha=0.35, s=14,
+                   color=model_color, edgecolors='none')
         ax.axhline(y=0, color=theme['accent'], linestyle='--', linewidth=1)
         ax.set_xlabel('预测值', fontsize=11)
-        if idx == 0:
-            ax.set_ylabel('残差', fontsize=11)
-        ax.set_title(f'{name}', fontsize=12, fontweight='bold')
+        ax.set_ylabel('残差', fontsize=11)
+        ax.set_title(f'{target_name} — {name} 残差图（测试集）', fontsize=13, fontweight='bold')
         ax.grid(True, alpha=0.3)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
 
-    fig.suptitle(f'{target_name} — 各模型残差图（测试集）', fontsize=14, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    save_path = os.path.join(plot_dir, f'图10_残差图_{target_name}.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    log.info(f"  已保存: {save_path}")
+        plt.tight_layout()
+        save_path = os.path.join(sub_dir, f'{idx + 1:02d}_{name}.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        log.info(f"  [{idx + 1}/{len(model_names)}] 已保存: {save_path}")
+
+    log.info(f"  图10全部完成，共 {len(model_names)} 张图，保存于: {sub_dir}")
 
 
 # =====================================================================
@@ -1061,121 +1173,122 @@ def plot_11_feature_importance(trained_models, test_results, feature_cols, targe
 # =====================================================================
 def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_name, plot_dir=PLOT_DIR):
     """
-    SHAP 特征影响-交互网络图。
-    - 节点 = 特征，大小 ∝ 平均 |SHAP| 主效应
-    - 节点颜色：平均 SHAP > 0 为蓝色（正向促进），< 0 为红色（负向抑制）
-    - 边 = 特征对之间的交互效应，粗细 ∝ 平均 |SHAP 交互值|
-    - 仅保留交互强度 Top 的边，避免过于密集
-    - 力导向布局（spring layout）
+    SHAP 特征影响-交互网络图（圆形布局 + 双 colorbar 样式）。
+    - 节点沿圆周均匀分布，大小 ∝ 平均 |SHAP| 主效应（Vimp）
+    - 节点颜色：绿色渐变，深浅 ∝ Vimp
+    - 边 = 所有特征对之间的交互效应（Vint），粗细 & 紫色深浅 ∝ Vint
+    - 右侧两个 colorbar：Vint（紫色渐变）、Vimp（绿色渐变）
     """
     import networkx as nx
-    from matplotlib.lines import Line2D
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+    from matplotlib.cm import ScalarMappable
 
     log.info(f"绘制图12: SHAP特征影响-交互网络图 — {target_name}")
-
-    theme = get_theme(target_name)
 
     n_features = len(feature_cols)
     shap_vals_array = shap_values.values  # (n_samples, n_features)
 
     # ---- 1. 计算节点属性 ----
-    # 主效应强度（平均 |SHAP|）
-    mean_abs_shap = np.abs(shap_vals_array).mean(axis=0)  # (n_features,)
-    # 平均 SHAP 值（判断正/负方向）
-    mean_shap = shap_vals_array.mean(axis=0)  # (n_features,)
+    mean_abs_shap = np.abs(shap_vals_array).mean(axis=0)  # Vimp
 
-    # ---- 2. 计算边属性（交互强度） ----
-    interaction_strengths = []
+    # ---- 2. 计算所有边的交互强度 ----
+    all_edges = []
     for i in range(n_features):
         for j in range(i + 1, n_features):
             strength = np.abs(shap_interaction[:, i, j]).mean()
-            interaction_strengths.append((i, j, strength))
+            all_edges.append((i, j, strength))
 
-    # 按交互强度排序，取 Top N 条边（避免图过于密集）
-    interaction_strengths.sort(key=lambda x: x[2], reverse=True)
-    # 动态确定保留边数：最多保留 n_features * 1.5 条边，至少 10 条
-    max_edges = max(10, int(n_features * 1.5))
-    top_edges = interaction_strengths[:max_edges]
+    # 按交互强度排序，确定阈值
+    all_strengths = np.array([s for _, _, s in all_edges])
+    max_strength = all_strengths.max() if len(all_strengths) > 0 else 1.0
+    # 过滤阈值：低于最大强度 5% 的边直接不画
+    filter_threshold = max_strength * 0.05
+    # 弱边阈值：低于最大强度 20% 的边画成浅灰色细线
+    weak_threshold = max_strength * 0.20
 
-    # 过滤掉强度极低的边（低于最大强度的 5%）
-    if len(top_edges) > 0:
-        max_strength = top_edges[0][2]
-        threshold = max_strength * 0.05
-        top_edges = [(i, j, s) for i, j, s in top_edges if s > threshold]
+    # 分类：强边（紫色渐变）和弱边（灰色细线）
+    strong_edges = [(i, j, s) for i, j, s in all_edges if s >= weak_threshold]
+    weak_edges = [(i, j, s) for i, j, s in all_edges if filter_threshold <= s < weak_threshold]
+    n_filtered = sum(1 for _, _, s in all_edges if s < filter_threshold)
+
+    log.info(f"  边分类: 强边 {len(strong_edges)} 条, 弱边(灰色) {len(weak_edges)} 条, "
+             f"过滤掉 {n_filtered} 条 (< 5% max)")
 
     # ---- 3. 构建网络图 ----
     G = nx.Graph()
-
-    # 添加节点
     for i, feat in enumerate(feature_cols):
-        G.add_node(feat,
-                   importance=mean_abs_shap[i],
-                   direction=mean_shap[i])
-
-    # 添加边
-    for i, j, strength in top_edges:
+        G.add_node(feat, importance=mean_abs_shap[i])
+    # 只添加未被过滤的边
+    for i, j, strength in strong_edges + weak_edges:
         G.add_edge(feature_cols[i], feature_cols[j], weight=strength)
 
-    # ---- 4. 布局 ----
-    # 使用 spring layout，重要性高的节点更居中
-    # k 参数控制节点间距，iterations 控制迭代次数
-    pos = nx.spring_layout(G, k=2.5, iterations=80, seed=RANDOM_STATE,
-                           weight='weight')
+    # ---- 4. 圆形布局 ----
+    pos = nx.circular_layout(G)
 
     # ---- 5. 绘图 ----
-    fig, ax = plt.subplots(figsize=(14, 12))
-    ax.set_facecolor('#FAFAFA')
+    fig, ax = plt.subplots(figsize=(12, 10))
+    ax.set_facecolor('white')
+    fig.set_facecolor('white')
 
-    # 节点大小：映射到 [400, 3000] 范围
-    node_sizes_raw = np.array([G.nodes[n]['importance'] for n in G.nodes()])
-    if node_sizes_raw.max() > node_sizes_raw.min():
-        node_sizes = 400 + (node_sizes_raw - node_sizes_raw.min()) / \
-                     (node_sizes_raw.max() - node_sizes_raw.min()) * 2600
+    # -- 紫色渐变 colormap（用于强边） --
+    purple_cmap = LinearSegmentedColormap.from_list(
+        'purple_edge', ['#F0E6FF', '#C9A0DC', '#9B59B6', '#6C3483', '#2E0854'])
+
+    # -- 绿色渐变 colormap（用于节点） --
+    green_cmap = LinearSegmentedColormap.from_list(
+        'green_node', ['#E8F5E9', '#A5D6A7', '#4CAF50', '#2E7D32', '#1B5E20'])
+
+    # -- 先绘制弱边（灰色细线，画在底层） --
+    if weak_edges:
+        weak_edge_list = [(feature_cols[i], feature_cols[j]) for i, j, _ in weak_edges]
+        nx.draw_networkx_edges(G, pos, ax=ax,
+                               edgelist=weak_edge_list,
+                               width=0.4,
+                               edge_color='#D5D5D5',
+                               style='solid',
+                               alpha=0.6)
+
+    # -- 再绘制强边（紫色渐变，画在上层） --
+    if strong_edges:
+        strong_edge_list = [(feature_cols[i], feature_cols[j]) for i, j, _ in strong_edges]
+        strong_weights = np.array([s for _, _, s in strong_edges])
+        # 强边的 colorbar 范围：从 weak_threshold 到 max_strength
+        vint_min_strong = weak_threshold
+        vint_max_strong = max_strength
+        edge_norm = Normalize(vmin=vint_min_strong, vmax=vint_max_strong)
+
+        # 边宽度：映射到 [1.0, 10]
+        if vint_max_strong > vint_min_strong:
+            strong_widths = 1.0 + (strong_weights - vint_min_strong) / \
+                            (vint_max_strong - vint_min_strong) * 9.0
+        else:
+            strong_widths = np.full_like(strong_weights, 3.0)
+
+        # 边颜色：紫色渐变
+        strong_colors = [purple_cmap(edge_norm(w)) for w in strong_weights]
+
+        nx.draw_networkx_edges(G, pos, ax=ax,
+                               edgelist=strong_edge_list,
+                               width=list(strong_widths),
+                               edge_color=strong_colors,
+                               style='solid')
     else:
-        node_sizes = np.full_like(node_sizes_raw, 1500)
+        # 如果没有强边，colorbar 使用全局范围
+        edge_norm = Normalize(vmin=0, vmax=max_strength)
 
-    # 节点颜色：正向/负向使用主题色，颜色深浅 ∝ |平均SHAP|
-    node_directions = np.array([G.nodes[n]['direction'] for n in G.nodes()])
-    node_colors = []
-    pos_rgb = theme['node_positive']
-    neg_rgb = theme['node_negative']
-    for d, imp in zip(node_directions, node_sizes_raw):
-        # 归一化强度用于颜色深浅
-        if node_sizes_raw.max() > 0:
-            intensity = 0.3 + 0.7 * (imp / node_sizes_raw.max())
-        else:
-            intensity = 0.5
-        if d >= 0:
-            # 正向促进
-            node_colors.append((pos_rgb[0] * intensity, pos_rgb[1] * intensity, pos_rgb[2] * intensity, 0.85))
-        else:
-            # 负向抑制
-            node_colors.append((neg_rgb[0] * intensity, neg_rgb[1] * intensity, neg_rgb[2] * intensity, 0.85))
+    # -- 节点属性 --
+    node_importances = np.array([G.nodes[n]['importance'] for n in G.nodes()])
+    vimp_min, vimp_max = node_importances.min(), node_importances.max()
+    node_norm = Normalize(vmin=vimp_min, vmax=vimp_max)
 
-    # 边宽度：映射到 [0.5, 8] 范围
-    edge_weights = np.array([G.edges[e]['weight'] for e in G.edges()])
-    if len(edge_weights) > 0 and edge_weights.max() > edge_weights.min():
-        edge_widths = 0.5 + (edge_weights - edge_weights.min()) / \
-                      (edge_weights.max() - edge_weights.min()) * 7.5
-    elif len(edge_weights) > 0:
-        edge_widths = np.full_like(edge_weights, 2.0)
+    # 节点大小：映射到 [300, 2800]
+    if vimp_max > vimp_min:
+        node_sizes = 300 + (node_importances - vimp_min) / (vimp_max - vimp_min) * 2500
     else:
-        edge_widths = []
+        node_sizes = np.full_like(node_importances, 1200)
 
-    # 边颜色：强度越高越深
-    edge_colors = []
-    for w in edge_weights:
-        if edge_weights.max() > 0:
-            alpha = 0.15 + 0.7 * (w / edge_weights.max())
-        else:
-            alpha = 0.3
-        edge_colors.append((0.4, 0.4, 0.4, alpha))
-
-    # 绘制边
-    nx.draw_networkx_edges(G, pos, ax=ax,
-                           width=list(edge_widths),
-                           edge_color=edge_colors,
-                           style='solid')
+    # 节点颜色：绿色渐变
+    node_colors = [green_cmap(node_norm(imp)) for imp in node_importances]
 
     # 绘制节点
     nx.draw_networkx_nodes(G, pos, ax=ax,
@@ -1184,61 +1297,60 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
                            edgecolors='white',
                            linewidths=1.5)
 
-    # 绘制标签（白色文字，带阴影效果）
-    # 先绘制黑色阴影
-    label_offset = {k: (v[0], v[1]) for k, v in pos.items()}
-    nx.draw_networkx_labels(G, label_offset, ax=ax,
-                            font_size=9, font_weight='bold',
-                            font_color='white')
+    # -- 标签：放在圆周外侧，字号加大 --
+    label_pos = {}
+    for node, (x, y) in pos.items():
+        # 沿径向向外偏移
+        r = np.sqrt(x**2 + y**2)
+        if r > 0:
+            offset = 0.18
+            label_pos[node] = (x + offset * x / r, y + offset * y / r)
+        else:
+            label_pos[node] = (x, y + 0.18)
 
-    # ---- 6. 在边上标注交互强度数值（仅 Top 5） ----
-    top_label_edges = top_edges[:5]
-    for i, j, strength in top_label_edges:
-        feat_a = feature_cols[i]
-        feat_b = feature_cols[j]
-        if G.has_edge(feat_a, feat_b):
-            x = (pos[feat_a][0] + pos[feat_b][0]) / 2
-            y = (pos[feat_a][1] + pos[feat_b][1]) / 2
-            ax.annotate(f'{strength:.4f}',
-                        xy=(x, y), fontsize=7, fontweight='bold',
-                        color='#333333', ha='center', va='center',
-                        bbox=dict(boxstyle='round,pad=0.15', facecolor='#FFFFCC',
-                                  alpha=0.85, edgecolor='#CCCC00', linewidth=0.5))
+    for node, (lx, ly) in label_pos.items():
+        # 根据位置决定对齐方式
+        cx, cy = pos[node]
+        if cx > 0.05:
+            ha = 'left'
+        elif cx < -0.05:
+            ha = 'right'
+        else:
+            ha = 'center'
+        ax.text(lx, ly, node, fontsize=12, fontweight='bold',
+                ha=ha, va='center', color='#222222')
 
-    # ---- 7. 图例 ----
-    legend_elements = [
-        Line2D([0], [0], marker='o', color='w', markerfacecolor=(*pos_rgb, 0.85),
-               markersize=14, label='正向促进 (SHAP > 0)'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor=(*neg_rgb, 0.85),
-               markersize=14, label='负向抑制 (SHAP < 0)'),
-        Line2D([0], [0], color='gray', linewidth=1, label='弱交互'),
-        Line2D([0], [0], color='gray', linewidth=5, label='强交互'),
-    ]
-    ax.legend(handles=legend_elements, loc='upper left', fontsize=10,
-              framealpha=0.9, edgecolor='#CCCCCC', fancybox=True)
-
-    # ---- 8. 标题和样式 ----
-    ax.set_title(f'{target_name} — SHAP 特征影响-交互网络图',
+    ax.set_title(f'{target_name} — SHAP 特征交互网络图',
                  fontsize=15, fontweight='bold', pad=20)
     ax.axis('off')
 
-    # 添加说明文字
-    fig.text(0.5, 0.02,
-             '节点大小 ∝ 特征主效应强度（平均|SHAP|）  |  '
-             '连线粗细 ∝ 特征对交互强度  |  '
-             '节点颜色：蓝=正向促进，红=负向抑制',
-             ha='center', fontsize=9, color='#666666',
-             style='italic')
+    # 留出右侧空间给 colorbar
+    plt.subplots_adjust(right=0.82)
 
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    # ---- 6. 双 colorbar ----
+    # Vint colorbar（紫色，上方）
+    cbar_ax1 = fig.add_axes([0.86, 0.55, 0.025, 0.30])
+    sm1 = ScalarMappable(cmap=purple_cmap, norm=edge_norm)
+    sm1.set_array([])
+    cb1 = fig.colorbar(sm1, cax=cbar_ax1)
+    cb1.set_label('Vint', fontsize=12, fontweight='bold')
+    cb1.ax.tick_params(labelsize=9)
+
+    # Vimp colorbar（绿色，下方）
+    cbar_ax2 = fig.add_axes([0.86, 0.15, 0.025, 0.30])
+    sm2 = ScalarMappable(cmap=green_cmap, norm=node_norm)
+    sm2.set_array([])
+    cb2 = fig.colorbar(sm2, cax=cbar_ax2)
+    cb2.set_label('Vimp', fontsize=12, fontweight='bold')
+    cb2.ax.tick_params(labelsize=9)
+
     save_path = os.path.join(plot_dir, f'图12_SHAP特征交互网络图_{target_name}.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
     log.info(f"  已保存: {save_path}")
 
     # 输出网络统计信息
     log.info(f"  网络统计: {G.number_of_nodes()} 个节点, {G.number_of_edges()} 条边")
-    # 输出度中心性 Top 5
     degree_centrality = nx.degree_centrality(G)
     sorted_dc = sorted(degree_centrality.items(), key=lambda x: x[1], reverse=True)[:5]
     log.info(f"  度中心性 Top 5:")
@@ -1296,8 +1408,18 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
 
     # ===== 图1: 模型性能验证图 =====
     if should_plot(1):
+        # 计算训练集预测值（用于 Joint Plot）
+        train_preds = {}
+        for m_name, m_obj in trained_models.items():
+            if m_name == 'OLS':
+                X_train_const = sm.add_constant(X_train_scaled)
+                train_preds[m_name] = m_obj.predict(X_train_const)
+            else:
+                train_preds[m_name] = m_obj.predict(X_train_scaled)
         plot_1_model_performance(y_test, test_results, target_name,
-                                 shap_model_name=shap_model_name, plot_dir=target_plot_dir)
+                                 shap_model_name=shap_model_name,
+                                 y_train=y_train, train_preds=train_preds,
+                                 plot_dir=target_plot_dir)
 
     # ===== 图10: 各模型残差图 =====
     if should_plot(10):
