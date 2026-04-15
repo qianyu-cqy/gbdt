@@ -100,6 +100,84 @@ MODEL_COLORS = {
     'LightGBM': '#9b59b6',
 }
 
+# ============ TARGET 主题色与色带配置 ============
+from matplotlib.colors import LinearSegmentedColormap
+
+# 色带1（TARGET_A 步行比例）：蓝色（高值）→ 淡紫灰（中间值）→ 粉红/玫瑰色（低值）
+_CMAP_A_DIVERGING = LinearSegmentedColormap.from_list(
+    'BluLavenderPink',
+    ['#E91E63', '#F8BBD0', '#D7C4D9', '#BBDEFB', '#1565C0']
+)
+# 色带2（TARGET_B 步行距离）：黄色（高值）→ 淡灰绿（中间值）→ 浅青/墨青色（低值）
+_CMAP_B_DIVERGING = LinearSegmentedColormap.from_list(
+    'TealSageYellow',
+    ['#00695C', '#B2DFDB', '#C8D5C4', '#FFF9C4', '#F9A825']
+)
+
+# 色带1 的顺序版本（用于非发散型热力图，如交互矩阵）
+_CMAP_A_SEQUENTIAL = LinearSegmentedColormap.from_list(
+    'LavenderToPink', ['#F0E6EE', '#F8BBD0', '#E91E63', '#880E4F']
+)
+# 色带2 的顺序版本
+_CMAP_B_SEQUENTIAL = LinearSegmentedColormap.from_list(
+    'MintToTeal', ['#E6EDEB', '#B2DFDB', '#00897B', '#004D40']
+)
+
+# 每个 TARGET 的完整主题色配置
+TARGET_THEME = {
+    TARGET_A: {
+        # 发散型色带（散点图、PDP、交互散点等）
+        'cmap_diverging': _CMAP_A_DIVERGING,
+        # 顺序型色带（交互矩阵热力图等）
+        'cmap_sequential': _CMAP_A_SEQUENTIAL,
+        # 主色调（LOWESS 线、置信区间、y=0 线等）
+        'primary': '#1565C0',        # 深蓝
+        # 强调色（阈值线、交叉点标注等）
+        'accent': '#C2185B',         # 玫瑰红
+        # 正向背景色（SHAP > 0 区域）
+        'bg_positive': '#E3F2FD',    # 浅蓝
+        # 负向背景色（SHAP < 0 区域）
+        'bg_negative': '#FCE4EC',    # 浅粉
+        # 图7 主效应条形图颜色
+        'bar_main': '#1565C0',       # 蓝色
+        # 图7 交互效应条形图颜色
+        'bar_interact': '#E91E63',   # 粉红
+        # 图11 特征重要性条形图颜色
+        'bar_importance': '#1976D2', # 蓝色
+        # 图12 正向节点 RGB（蓝色系）
+        'node_positive': (0.2, 0.4, 0.9),
+        # 图12 负向节点 RGB（粉红系）
+        'node_negative': (0.91, 0.12, 0.39),
+        # 图7 交互占比高阈值颜色
+        'ratio_high': '#C2185B',
+        # 图7 交互占比中阈值颜色
+        'ratio_mid': '#5C6BC0',
+        # 图7 交互占比低阈值颜色
+        'ratio_low': '#90A4AE',
+    },
+    TARGET_B: {
+        'cmap_diverging': _CMAP_B_DIVERGING,
+        'cmap_sequential': _CMAP_B_SEQUENTIAL,
+        'primary': '#00695C',        # 墨青
+        'accent': '#F57F17',         # 深黄
+        'bg_positive': '#E0F2F1',    # 浅青
+        'bg_negative': '#FFFDE7',    # 浅黄
+        'bar_main': '#00695C',       # 墨青
+        'bar_interact': '#F9A825',   # 黄色
+        'bar_importance': '#00796B', # 青色
+        'node_positive': (0.0, 0.41, 0.36),
+        'node_negative': (0.98, 0.66, 0.15),
+        'ratio_high': '#E65100',
+        'ratio_mid': '#00897B',
+        'ratio_low': '#90A4AE',
+    },
+}
+
+
+def get_theme(target_name):
+    """获取指定 TARGET 的主题色配置，若未找到则返回 TARGET_A 的配置作为默认值"""
+    return TARGET_THEME.get(target_name, TARGET_THEME[TARGET_A])
+
 # ============ 日志 ============
 logging.basicConfig(
     level=logging.INFO,
@@ -239,6 +317,7 @@ def plot_1_model_performance(y_test, test_results, target_name, shap_model_name=
     """
     log.info(f"绘制图1: 模型性能验证图 — {target_name}（SHAP模型: {shap_model_name}）")
 
+    theme = get_theme(target_name)
     model_color = MODEL_COLORS.get(shap_model_name, '#e74c3c')
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
@@ -253,7 +332,7 @@ def plot_1_model_performance(y_test, test_results, target_name, shap_model_name=
     # 高亮 SHAP 分析所用的模型
     for i, m in enumerate(model_names):
         if m == shap_model_name:
-            bars[i].set_edgecolor('#c0392b')
+            bars[i].set_edgecolor(theme['accent'])
             bars[i].set_linewidth(2.5)
 
     # 在柱子上方标注数值
@@ -324,8 +403,13 @@ def plot_2_shap_bar(shap_values, feature_cols, target_name, plot_dir=PLOT_DIR):
     """SHAP 全局特征重要性条形图"""
     log.info(f"绘制图2: SHAP全局特征贡献图 — {target_name}")
 
+    theme = get_theme(target_name)
+
     fig, ax = plt.subplots(figsize=(10, 8))
     shap.plots.bar(shap_values, max_display=len(feature_cols), show=False, ax=ax)
+    # 将条形图颜色统一为主题色
+    for patch in ax.patches:
+        patch.set_facecolor(theme['bar_importance'])
     ax.set_title(f'{target_name} — SHAP 全局特征贡献', fontsize=14, fontweight='bold')
     plt.tight_layout()
     save_path = os.path.join(plot_dir, f'图2_SHAP特征贡献_{target_name}.png')
@@ -341,8 +425,11 @@ def plot_3_shap_beeswarm(shap_values, feature_cols, target_name, plot_dir=PLOT_D
     """SHAP 蜂群图"""
     log.info(f"绘制图3: SHAP蜂群图 — {target_name}")
 
+    theme = get_theme(target_name)
+
     fig, ax = plt.subplots(figsize=(12, 8))
-    shap.plots.beeswarm(shap_values, max_display=len(feature_cols), show=False, plot_size=None, ax=ax)
+    shap.plots.beeswarm(shap_values, max_display=len(feature_cols), show=False,
+                         plot_size=None, ax=ax, color=theme['cmap_diverging'])
     ax.set_title(f'{target_name} — SHAP 蜂群图', fontsize=14, fontweight='bold')
     plt.tight_layout()
     save_path = os.path.join(plot_dir, f'图3_SHAP蜂群图_{target_name}.png')
@@ -412,6 +499,8 @@ def plot_4_shap_dependence(shap_values, X_data, feature_cols, target_name, scale
     如果提供 scaler，则将横坐标还原为原始值（更直观）。
     """
     log.info(f"绘制图4: SHAP单特征依赖图（LOWESS增强版）— {target_name}")
+
+    theme = get_theme(target_name)
 
     # 按平均 |SHAP| 排序，取 Top N
     mean_abs_shap = np.abs(shap_values.values).mean(axis=0)
@@ -489,45 +578,45 @@ def plot_4_shap_dependence(shap_values, X_data, feature_cols, target_name, scale
                 left_sign = -1  # 默认左侧为负
 
             if left_sign < 0:
-                # 左侧负（浅红），右侧正（浅蓝）
-                ax.axvspan(plot_xmin, threshold, color='#FFEBEE', alpha=0.4, zorder=0)
-                ax.axvspan(threshold, plot_xmax, color='#E3F2FD', alpha=0.4, zorder=0)
+                # 左侧负，右侧正
+                ax.axvspan(plot_xmin, threshold, color=theme['bg_negative'], alpha=0.4, zorder=0)
+                ax.axvspan(threshold, plot_xmax, color=theme['bg_positive'], alpha=0.4, zorder=0)
             else:
-                # 左侧正（浅蓝），右侧负（浅红）
-                ax.axvspan(plot_xmin, threshold, color='#E3F2FD', alpha=0.4, zorder=0)
-                ax.axvspan(threshold, plot_xmax, color='#FFEBEE', alpha=0.4, zorder=0)
+                # 左侧正，右侧负
+                ax.axvspan(plot_xmin, threshold, color=theme['bg_positive'], alpha=0.4, zorder=0)
+                ax.axvspan(threshold, plot_xmax, color=theme['bg_negative'], alpha=0.4, zorder=0)
         else:
             # 无交叉点，根据 LOWESS 均值判断整体正负
             if np.mean(lowess_y) >= 0:
-                ax.axvspan(plot_xmin, plot_xmax, color='#E3F2FD', alpha=0.3, zorder=0)
+                ax.axvspan(plot_xmin, plot_xmax, color=theme['bg_positive'], alpha=0.3, zorder=0)
             else:
-                ax.axvspan(plot_xmin, plot_xmax, color='#FFEBEE', alpha=0.3, zorder=0)
+                ax.axvspan(plot_xmin, plot_xmax, color=theme['bg_negative'], alpha=0.3, zorder=0)
 
         # 2. 散点图（颜色映射交互特征）
-        scatter = ax.scatter(feat_vals, shap_vals, c=color_vals, cmap='RdBu',
+        scatter = ax.scatter(feat_vals, shap_vals, c=color_vals, cmap=theme['cmap_diverging'],
                              alpha=0.5, s=12, edgecolors='none', zorder=2)
 
         # 3. LOWESS 曲线
-        ax.plot(lowess_x, lowess_y, color='#1565C0', linewidth=2.5, zorder=4, label='LOWESS')
+        ax.plot(lowess_x, lowess_y, color=theme['primary'], linewidth=2.5, zorder=4, label='LOWESS')
 
         # 4. 置信区间
-        ax.fill_between(lowess_x, ci_lower, ci_upper, alpha=0.2, color='#1565C0', zorder=3,
+        ax.fill_between(lowess_x, ci_lower, ci_upper, alpha=0.2, color=theme['primary'], zorder=3,
                          label='95% 置信区间')
 
         # 5. y=0 水平虚线
-        ax.axhline(y=0, color='#1565C0', linestyle='--', linewidth=1, alpha=0.6, zorder=3)
+        ax.axhline(y=0, color=theme['primary'], linestyle='--', linewidth=1, alpha=0.6, zorder=3)
 
         # 6. 阈值标注（交叉点）
         for cross_x in crossings:
-            ax.axvline(x=cross_x, color='#D32F2F', linestyle='--', linewidth=1.5, alpha=0.8, zorder=4)
+            ax.axvline(x=cross_x, color=theme['accent'], linestyle='--', linewidth=1.5, alpha=0.8, zorder=4)
             # 在交叉点处标注数值
             y_range = shap_vals.max() - shap_vals.min()
             ax.annotate(f'{cross_x:.2f}',
                         xy=(cross_x, 0),
                         xytext=(cross_x, -y_range * 0.08),
-                        fontsize=9, fontweight='bold', color='#D32F2F',
+                        fontsize=9, fontweight='bold', color=theme['accent'],
                         ha='center', va='top',
-                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='#D32F2F'),
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor=theme['accent']),
                         zorder=5)
 
         # 7. 颜色条
@@ -569,6 +658,8 @@ def plot_5_pdp_2d(model, X_train_scaled, feature_cols, target_name, scaler=None,
     如果提供 scaler，则将坐标轴还原为原始值。
     """
     log.info(f"绘制图5: 二维PDP部分依赖图 — {target_name}")
+
+    theme = get_theme(target_name)
 
     # 使用 SHAP 重要性排名前 6 的特征，选取有意义的组合
     explainer = shap.TreeExplainer(model)
@@ -622,7 +713,7 @@ def plot_5_pdp_2d(model, X_train_scaled, feature_cols, target_name, scaler=None,
         zz = pd_result['average'][0].T  # 转置以匹配 meshgrid
 
         # 绘制热力图
-        contour = ax.contourf(xx, yy, zz, levels=20, cmap='RdYlBu_r', alpha=0.9)
+        contour = ax.contourf(xx, yy, zz, levels=20, cmap=theme['cmap_diverging'], alpha=0.9)
         fig.colorbar(contour, ax=ax, shrink=0.8, label='部分依赖值')
         ax.set_xlabel(feat_a, fontsize=11)
         ax.set_ylabel(feat_b, fontsize=11)
@@ -649,6 +740,8 @@ def plot_6_interaction_matrix(shap_interaction, feature_cols, target_name, plot_
     """
     log.info(f"绘制图6: 特征交互效应复合矩阵图 — {target_name}")
 
+    theme = get_theme(target_name)
+
     n_features = len(feature_cols)
     # 计算每对特征的平均绝对交互值
     interaction_matrix = np.zeros((n_features, n_features))
@@ -668,7 +761,7 @@ def plot_6_interaction_matrix(shap_interaction, feature_cols, target_name, plot_
         interaction_matrix,
         xticklabels=feature_cols,
         yticklabels=feature_cols,
-        cmap='YlOrRd',
+        cmap=theme['cmap_sequential'],
         annot=False,
         fmt='.4f',
         linewidths=0.5,
@@ -707,6 +800,8 @@ def plot_7_main_vs_interaction(shap_values, shap_interaction, feature_cols, targ
     """
     log.info(f"绘制图7: 主效应与交互效应对比图 — {target_name}")
 
+    theme = get_theme(target_name)
+
     n_features = len(feature_cols)
 
     # 主效应：对角线上的 SHAP 交互值的平均绝对值
@@ -735,8 +830,8 @@ def plot_7_main_vs_interaction(shap_values, shap_interaction, feature_cols, targ
 
     # 左图：堆叠条形图
     y_pos = np.arange(n_features)
-    ax1.barh(y_pos, sorted_main, color='#3498db', label='主效应', height=0.7)
-    ax1.barh(y_pos, sorted_inter, left=sorted_main, color='#e74c3c', label='交互效应', height=0.7)
+    ax1.barh(y_pos, sorted_main, color=theme['bar_main'], label='主效应', height=0.7)
+    ax1.barh(y_pos, sorted_inter, left=sorted_main, color=theme['bar_interact'], label='交互效应', height=0.7)
     ax1.set_yticks(y_pos)
     ax1.set_yticklabels(sorted_features, fontsize=9)
     ax1.set_xlabel('平均 |SHAP 值|', fontsize=12)
@@ -747,14 +842,14 @@ def plot_7_main_vs_interaction(shap_values, shap_interaction, feature_cols, targ
     ax1.spines['right'].set_visible(False)
 
     # 右图：交互占比
-    colors = ['#e74c3c' if r > 0.3 else '#f39c12' if r > 0.15 else '#95a5a6' for r in sorted_ratio]
+    colors = [theme['ratio_high'] if r > 0.3 else theme['ratio_mid'] if r > 0.15 else theme['ratio_low'] for r in sorted_ratio]
     ax2.barh(y_pos, sorted_ratio * 100, color=colors, height=0.7)
     ax2.set_yticks(y_pos)
     ax2.set_yticklabels([])
     ax2.set_xlabel('交互效应占比 (%)', fontsize=12)
     ax2.set_title('交互占比', fontsize=13, fontweight='bold')
-    ax2.axvline(x=30, color='red', linestyle='--', linewidth=1, alpha=0.5, label='30% 阈值')
-    ax2.axvline(x=15, color='orange', linestyle='--', linewidth=1, alpha=0.5, label='15% 阈值')
+    ax2.axvline(x=30, color=theme['ratio_high'], linestyle='--', linewidth=1, alpha=0.5, label='30% 阈值')
+    ax2.axvline(x=15, color=theme['ratio_mid'], linestyle='--', linewidth=1, alpha=0.5, label='15% 阈值')
     ax2.legend(fontsize=8, loc='lower right')
     ax2.grid(True, alpha=0.3, axis='x')
     ax2.spines['top'].set_visible(False)
@@ -785,6 +880,8 @@ def plot_8_interaction_scatter(shap_interaction, X_data, feature_cols, target_na
     如果提供 scaler，则将横轴和颜色编码还原为原始值。
     """
     log.info(f"绘制图8: SHAP成对交互散点图 — {target_name}")
+
+    theme = get_theme(target_name)
 
     if top_pairs is None:
         # 自动计算 Top 3 交互对
@@ -825,7 +922,7 @@ def plot_8_interaction_scatter(shap_interaction, X_data, feature_cols, target_na
         x_vals = X_display[:, i]
         color_vals = X_display[:, j]
 
-        scatter = ax.scatter(x_vals, interaction_vals, c=color_vals, cmap='coolwarm',
+        scatter = ax.scatter(x_vals, interaction_vals, c=color_vals, cmap=theme['cmap_diverging'],
                              alpha=0.5, s=10, edgecolors='none')
         ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
         ax.set_xlabel(feat_a, fontsize=11)
@@ -873,6 +970,8 @@ def plot_10_residuals(y_test, test_results, target_name, plot_dir=PLOT_DIR):
     """
     log.info(f"绘制图10: 各模型残差图 — {target_name}")
 
+    theme = get_theme(target_name)
+
     model_names = list(test_results.keys())
     n_models = len(model_names)
 
@@ -888,7 +987,7 @@ def plot_10_residuals(y_test, test_results, target_name, plot_dir=PLOT_DIR):
         residuals = y_test - y_pred
         ax.scatter(y_pred, residuals, alpha=0.3, s=10,
                    color=colors_list[idx % len(colors_list)], edgecolors='none')
-        ax.axhline(y=0, color='red', linestyle='--', linewidth=1)
+        ax.axhline(y=0, color=theme['accent'], linestyle='--', linewidth=1)
         ax.set_xlabel('预测值', fontsize=11)
         if idx == 0:
             ax.set_ylabel('残差', fontsize=11)
@@ -942,7 +1041,8 @@ def plot_11_feature_importance(trained_models, test_results, feature_cols, targe
     }).sort_values('重要性', ascending=True).reset_index(drop=True)
 
     fig, ax = plt.subplots(figsize=(10, 8))
-    ax.barh(feat_imp['特征'], feat_imp['重要性'], color='#2ca02c', alpha=0.8)
+    theme = get_theme(target_name)
+    ax.barh(feat_imp['特征'], feat_imp['重要性'], color=theme['bar_importance'], alpha=0.8)
     ax.set_xlabel('特征重要性', fontsize=12)
     ax.set_title(f'{target_name} — {best_tree_name}（调优后）特征重要性', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3, axis='x')
@@ -972,6 +1072,8 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
     from matplotlib.lines import Line2D
 
     log.info(f"绘制图12: SHAP特征影响-交互网络图 — {target_name}")
+
+    theme = get_theme(target_name)
 
     n_features = len(feature_cols)
     shap_vals_array = shap_values.values  # (n_samples, n_features)
@@ -1032,9 +1134,11 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
     else:
         node_sizes = np.full_like(node_sizes_raw, 1500)
 
-    # 节点颜色：正向蓝色，负向红色，颜色深浅 ∝ |平均SHAP|
+    # 节点颜色：正向/负向使用主题色，颜色深浅 ∝ |平均SHAP|
     node_directions = np.array([G.nodes[n]['direction'] for n in G.nodes()])
     node_colors = []
+    pos_rgb = theme['node_positive']
+    neg_rgb = theme['node_negative']
     for d, imp in zip(node_directions, node_sizes_raw):
         # 归一化强度用于颜色深浅
         if node_sizes_raw.max() > 0:
@@ -1042,11 +1146,11 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
         else:
             intensity = 0.5
         if d >= 0:
-            # 蓝色系（正向促进）
-            node_colors.append((0.2 * intensity, 0.4 * intensity, 0.9 * intensity, 0.85))
+            # 正向促进
+            node_colors.append((pos_rgb[0] * intensity, pos_rgb[1] * intensity, pos_rgb[2] * intensity, 0.85))
         else:
-            # 红色系（负向抑制）
-            node_colors.append((0.9 * intensity, 0.25 * intensity, 0.2 * intensity, 0.85))
+            # 负向抑制
+            node_colors.append((neg_rgb[0] * intensity, neg_rgb[1] * intensity, neg_rgb[2] * intensity, 0.85))
 
     # 边宽度：映射到 [0.5, 8] 范围
     edge_weights = np.array([G.edges[e]['weight'] for e in G.edges()])
@@ -1103,9 +1207,9 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
 
     # ---- 7. 图例 ----
     legend_elements = [
-        Line2D([0], [0], marker='o', color='w', markerfacecolor=(0.2, 0.4, 0.9, 0.85),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor=(*pos_rgb, 0.85),
                markersize=14, label='正向促进 (SHAP > 0)'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor=(0.9, 0.25, 0.2, 0.85),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor=(*neg_rgb, 0.85),
                markersize=14, label='负向抑制 (SHAP < 0)'),
         Line2D([0], [0], color='gray', linewidth=1, label='弱交互'),
         Line2D([0], [0], color='gray', linewidth=5, label='强交互'),
