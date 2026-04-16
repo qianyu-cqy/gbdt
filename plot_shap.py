@@ -73,7 +73,7 @@ os.makedirs(PLOT_DIR, exist_ok=True)
 
 TARGET_A = '步行比例'
 TARGET_B = '步行距离'
-EXCLUDE_COLS = ['街区编号', TARGET_A, TARGET_B]
+ALWAYS_EXCLUDE = ['街区编号']
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 N_JOBS = -1
@@ -188,15 +188,28 @@ log = logging.getLogger('plot_shap')
 
 
 # ============ 数据加载 ============
-def load_data():
-    """加载数据并返回特征矩阵、因变量、特征名"""
+def load_data(target_cols):
+    """加载数据并返回特征矩阵、因变量字典、特征名"""
     df = pd.read_csv(DATA_PATH, encoding='utf-8')
-    feature_cols = [c for c in df.columns if c not in EXCLUDE_COLS]
+
+    # 检查因变量是否存在
+    missing = [t for t in target_cols if t not in df.columns]
+    if missing:
+        log.error(f"以下因变量在数据中不存在: {missing}")
+        log.error(f"数据中可用的列: {df.columns.tolist()}")
+        sys.exit(1)
+
+    # 动态生成排除列
+    exclude_cols = ALWAYS_EXCLUDE + target_cols
+    feature_cols = [c for c in df.columns if c not in exclude_cols]
     X = df[feature_cols].values
-    y_a = df[TARGET_A].values
-    y_b = df[TARGET_B].values
+
+    # 返回因变量字典
+    y_dict = {t: df[t].values for t in target_cols}
+
     log.info(f"数据加载完成: {X.shape[0]} 样本, {len(feature_cols)} 特征")
-    return X, y_a, y_b, feature_cols
+    log.info(f"因变量: {target_cols}")
+    return X, y_dict, feature_cols
 
 
 def load_best_params(target_name):
@@ -1436,12 +1449,20 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
     if should_plot(11):
         plot_11_feature_importance(trained_models, test_results, feature_cols, target_name, plot_dir=target_plot_dir)
 
-    # ===== 计算 SHAP 值（图2/3/4/9/12 共用） =====
-    shap_values = None
-    if any(should_plot(n) for n in [2, 3, 4, 9, 12]):
-        shap_values, explainer = compute_shap_values(
-            shap_model, X_train_scaled, feature_cols
-        )
+        # ===== 计算 SHAP 值（图2/3/4/9/12 共用） =====
+        shap_values = None
+        if any(should_plot(n) for n in [2, 3, 4, 9, 12]):
+            shap_values, explainer = compute_shap_values(
+                shap_model, X_train_scaled, feature_cols
+            )
+
+            # ===== 导出每个样本的 SHAP 值到 CSV =====
+            shap_df = pd.DataFrame(shap_values.values, columns=feature_cols)
+            shap_df.insert(0, '样本序号', range(len(shap_df)))
+            shap_df['base_value'] = shap_values.base_values
+            csv_path = os.path.join(target_plot_dir, f'SHAP值_逐样本_{target_name}.csv')
+            shap_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+            log.info(f"  SHAP值CSV已导出: {csv_path} ({shap_df.shape[0]} 样本 × {len(feature_cols)} 特征)")
 
     # ===== 图2: SHAP Bar Plot =====
     if should_plot(2) and shap_values is not None:
@@ -1504,9 +1525,13 @@ def parse_args():
         help='要绘制的图例编号（1-12），不指定则绘制全部\n例如: --plots 1 2 3'
     )
     parser.add_argument(
-        '--target', type=str, default=None,
-        choices=[TARGET_A, TARGET_B],
-        help=f'只绘制指定因变量的图例\n可选: {TARGET_A}, {TARGET_B}'
+        '--target', type=str, nargs='+', default=None,
+        help=(
+            '指定因变量（可多选，空格分隔）\n'
+            '例如: --target 步行比例\n'
+            '      --target 步行比例 步行距离\n'
+            '不指定则自动检测数据中可用的因变量'
+        )
     )
     return parser.parse_args()
 
@@ -1525,17 +1550,25 @@ def main():
     else:
         log.info("  绘制全部图例 (1-12)")
 
+    # 确定因变量列表
+    if args.target:
+        # 命令行指定
+        target_cols = args.target
+    else:
+        # 自动检测数据中存在的已知因变量
+        df_head = pd.read_csv(DATA_PATH, encoding='utf-8', nrows=0)
+        known_targets = [TARGET_A, TARGET_B]
+        target_cols = [t for t in known_targets if t in df_head.columns]
+        if not target_cols:
+            log.error("数据中未找到任何已知因变量（步行比例/步行距离）")
+            sys.exit(1)
+        log.info(f"  自动检测到因变量: {target_cols}")
+
     # 加载数据
-    X, y_a, y_b, feature_cols = load_data()
+    X, y_dict, feature_cols = load_data(target_cols)
 
-    targets = {}
-    if args.target is None or args.target == TARGET_A:
-        targets[TARGET_A] = y_a
-    if args.target is None or args.target == TARGET_B:
-        targets[TARGET_B] = y_b
-
-    for target_name, y in targets.items():
-        run_plots_for_target(target_name, y, X, feature_cols, plot_ids=args.plots)
+    for target_name in target_cols:
+        run_plots_for_target(target_name, y_dict[target_name], X, feature_cols, plot_ids=args.plots)
 
     log.info(f"\n{'='*70}")
     log.info(f"  所有图例绘制完成！")

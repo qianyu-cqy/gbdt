@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-步行活力与步行范围的多模型对比实验（改进版）
+步行活力与步行范围的多模型对比实验（改进版 v2）
 =============================================
-模型A：Y = 步行比例 ~ f(X₁, X₂, ..., X₂₄)  → 解释"步行活力的形成"
-模型B：Y = 步行距离     ~ f(X₁, X₂, ..., X₂₄)  → 解释"步行范围的限制"
+支持动态选择因变量：
+  --targets 步行比例          → 仅运行步行比例模型
+  --targets 步行比例 步行距离  → 同时运行两个模型
+  --targets 步行距离          → 仅运行步行距离模型
 
 实验流程：
   1. 数据 80/20 划分为训练集和测试集（测试集完全隔离）
@@ -12,7 +14,6 @@
   3. 使用最优参数在完整训练集上重新训练
   4. 在 hold-out 测试集上评估最终性能（MAE、MSE、RMSE、R²）
 
-数据规模：~3028 样本，24 个自变量（中小规模数据集）
 对比模型：OLS、GBDT、RF、XGBOOST、LightGBM
 """
 
@@ -58,45 +59,42 @@ LOG_DIR = os.path.join(BASE_DIR, 'logs')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-TARGET_A = '步行比例'
-TARGET_B = '步行距离'
-EXCLUDE_COLS = ['街区编号', TARGET_A, TARGET_B]
+# ============ 不再硬编码因变量，改为动态获取 ============
+ALWAYS_EXCLUDE = ['街区编号']  # 始终排除的列（非特征列）
 
 TEST_SIZE = 0.2          # 测试集比例
 INNER_CV_FOLDS = 5       # 调参内层交叉验证折数
-N_ITER_SEARCH = 60       # RandomizedSearchCV 最大搜索次数（提升采样量，充分探索大搜索空间）
+N_ITER_SEARCH = 60       # RandomizedSearchCV 最大搜索次数
 RANDOM_STATE = 42
 N_JOBS = -1              # 并行核数
 
+# ============ 因变量描述映射（可扩展） ============
+TARGET_DESCRIPTIONS = {
+    '步行比例': '模型A：步行比例（步行活力的形成）',
+    '步行距离': '模型B：步行距离（步行范围的限制）',
+}
 
 # ============ 日志系统 ============
 def setup_logger():
-    """
-    配置日志系统：所有输出同时写入控制台和带时间戳后缀的日志文件
-    日志文件路径: logs/experiment_YYYYMMDD_HHMMSS.log
-    """
+    """配置日志系统"""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_filename = f'experiment_{timestamp}.log'
     log_path = os.path.join(LOG_DIR, log_filename)
 
-    # 创建 logger
     logger = logging.getLogger('experiment')
     logger.setLevel(logging.INFO)
-    logger.handlers.clear()  # 防止重复添加
+    logger.handlers.clear()
 
-    # 格式：时间 + 级别 + 消息
     formatter = logging.Formatter(
         fmt='[%(asctime)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # 文件 handler
     file_handler = logging.FileHandler(log_path, encoding='utf-8')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # 控制台 handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
@@ -105,25 +103,38 @@ def setup_logger():
     logger.info(f"日志文件: {log_path}")
     return logger, log_path
 
-
 # 全局 logger
 logger = None
 
-
 def log(msg=''):
-    """统一日志输出函数，同时写入控制台和日志文件"""
+    """统一日志输出函数"""
     if logger:
         logger.info(msg)
     else:
         print(msg)
 
-
 # ============ 数据加载与预处理 ============
-def load_data():
-    """加载并预处理数据"""
+def load_data(target_cols):
+    """
+    加载并预处理数据
+
+    参数:
+        target_cols: list[str], 用户选择的因变量列表
+
+    返回:
+        df: 完整数据
+        feature_cols: 自变量列名列表
+    """
     df = pd.read_csv(DATA_PATH, encoding='utf-8')
     log(f"数据维度: {df.shape}")
     log(f"列名: {df.columns.tolist()}")
+
+    # 检查因变量是否存在
+    missing_targets = [t for t in target_cols if t not in df.columns]
+    if missing_targets:
+        log(f"\n❌ 错误: 以下因变量在数据中不存在: {missing_targets}")
+        log(f"   数据中可用的列: {df.columns.tolist()}")
+        sys.exit(1)
 
     missing = df.isnull().sum()
     if missing.sum() > 0:
@@ -133,97 +144,128 @@ def load_data():
 
     df = df.dropna().reset_index(drop=True)
 
-    feature_cols = [c for c in df.columns if c not in EXCLUDE_COLS]
-    X = df[feature_cols].values
-    y_a = df[TARGET_A].values
-    y_b = df[TARGET_B].values
+    # 排除列 = 始终排除的列 + 所有因变量列
+    exclude_cols = ALWAYS_EXCLUDE + target_cols
+    feature_cols = [c for c in df.columns if c not in exclude_cols]
 
-    n_samples = X.shape[0]
+    n_samples = df.shape[0]
     n_features = len(feature_cols)
-    log(f"\n自变量数量: {n_features}")
+    log(f"\n因变量: {target_cols}")
+    log(f"自变量数量: {n_features}")
     log(f"自变量列表: {feature_cols}")
     log(f"样本数量: {n_samples}")
     log(f"样本/特征比: {n_samples / n_features:.1f}:1")
     log(f"训练集预计: {int(n_samples * (1 - TEST_SIZE))} 样本")
 
-    return X, y_a, y_b, feature_cols
+    return df, feature_cols
 
+# ============ 自动检测数据中可用的因变量 ============
+def detect_available_targets():
+    """
+    扫描数据文件，检测哪些已知因变量存在
+    用于交互式选择模式
+    """
+    df_head = pd.read_csv(DATA_PATH, encoding='utf-8', nrows=0)
+    columns = df_head.columns.tolist()
+
+    known_targets = ['步行比例', '步行距离']
+    available = [t for t in known_targets if t in columns]
+    return available, columns
+
+# ============ 交互式选择因变量 ============
+def interactive_select_targets():
+    """
+    当用户未通过命令行指定因变量时，进入交互式选择
+    """
+    available, all_columns = detect_available_targets()
+
+    print("\n" + "=" * 60)
+    print("  因变量选择")
+    print("=" * 60)
+    print(f"\n数据文件: {DATA_PATH}")
+    print(f"数据列名: {all_columns}")
+    print(f"\n已识别的可用因变量:")
+
+    if not available:
+        print("  ⚠️ 未检测到已知因变量（步行比例/步行距离）")
+        print("  请手动输入因变量名称（用逗号分隔）:")
+        user_input = input("  > ").strip()
+        if not user_input:
+            print("  未输入任何因变量，退出。")
+            sys.exit(0)
+        targets = [t.strip() for t in user_input.split(',')]
+        return targets
+
+    for i, t in enumerate(available, 1):
+        desc = TARGET_DESCRIPTIONS.get(t, t)
+        print(f"  [{i}] {t} — {desc}")
+
+    print(f"\n请选择（输入编号，多个用逗号分隔，直接回车=全选）:")
+    user_input = input("  > ").strip()
+
+    if not user_input:
+        # 直接回车 = 全选
+        targets = available
+        print(f"  已选择全部: {targets}")
+    else:
+        try:
+            indices = [int(x.strip()) for x in user_input.split(',')]
+            targets = [available[i - 1] for i in indices if 1 <= i <= len(available)]
+            if not targets:
+                print("  选择无效，退出。")
+                sys.exit(0)
+            print(f"  已选择: {targets}")
+        except (ValueError, IndexError):
+            print("  输入无效，退出。")
+            sys.exit(0)
+
+    return targets
 
 # ============ 超参数搜索空间定义 ============
 def get_param_grids():
-    """
-    为每个模型定义超参数搜索空间
-
-    设计原则（针对 ~3028 样本、24 特征的中小数据集）：
-    ─────────────────────────────────────────────────────
-    1. 树深度控制在较浅范围（3~7），防止在小数据上过拟合
-    2. n_estimators 扩展到 500~800，适配低学习率场景
-       （lr=0.01 时需要更多树才能充分学习）
-    3. learning_rate 细化中间区域（增加 0.03/0.08 档位），
-       避免 0.01→0.05 跨度过大
-    4. min_samples_leaf 下限提高到 5（RF原为3，统计意义弱），
-       确保叶节点有足够样本（训练集约2422样本）
-    5. subsample 扩展到 1.0，允许搜索不采样的情况
-    6. 正则化参数细化低区域（reg_lambda 增加 0.1/0.5 档位），
-       解决原搜索空间中正则化参数频繁命中边界的问题
-    7. 搜索次数从 30 提升到 60，提高大搜索空间的覆盖率
-    """
+    """为每个模型定义超参数搜索空间（与原版完全一致）"""
     param_grids = {
-        # GBDT: 不支持 n_jobs 并行，搜索空间需精简
-        # 优化：扩展 n_estimators/max_depth/subsample 上界（原值频繁命中边界）
-        #       细化 learning_rate 中间区域，增加 0.03 档位
-        #       n_estimators 扩展到 500 以适配低学习率场景
         'GBDT': {
-            'n_estimators': [100, 200, 300, 500],       # 扩展上界，适配低lr
-            'max_depth': [3, 4, 5, 6, 7],               # 扩展上界（原5频繁命中）
-            'learning_rate': [0.01, 0.03, 0.05, 0.1],   # 细化中间区域
-            'subsample': [0.7, 0.8, 0.9, 1.0],          # 扩展上界（原0.9命中）
-            'min_samples_leaf': [5, 10, 20],             # 保持不变，范围合理
-            'min_samples_split': [10, 20, 30],           # 增加30档位
+            'n_estimators': [100, 200, 300, 500],
+            'max_depth': [3, 4, 5, 6, 7],
+            'learning_rate': [0.01, 0.03, 0.05, 0.1],
+            'subsample': [0.7, 0.8, 0.9, 1.0],
+            'min_samples_leaf': [5, 10, 20],
+            'min_samples_split': [10, 20, 30],
         },
-        # RF: 优化正则化参数，防止过拟合
-        # 原 min_samples_leaf=3 过小（叶节点仅3样本，统计意义弱）
-        # 原 max_depth 从12直接跳到None，缺少中间过渡值
         'RF': {
-            'n_estimators': [200, 300, 500],             # 提高下限，RF对树数不敏感
-            'max_depth': [8, 12, 16, 20, None],          # 增加中间值，避免直接跳None
-            'min_samples_split': [5, 10, 15, 20],        # 增加15档位
-            'min_samples_leaf': [5, 10, 15, 20],         # 提高下限到5（原3过小）
-            'max_features': ['sqrt', 0.3, 0.5, 0.7],    # 增加0.3，更多特征采样选择
+            'n_estimators': [200, 300, 500],
+            'max_depth': [8, 12, 16, 20, None],
+            'min_samples_split': [5, 10, 15, 20],
+            'min_samples_leaf': [5, 10, 15, 20],
+            'max_features': ['sqrt', 0.3, 0.5, 0.7],
         },
-        # XGBOOST: 扩展正则化上界（第3轮步行距离 reg_lambda=5.0/reg_alpha=1.0 命中上界）
-        #          learning_rate=0.01 命中下界，向下探索 0.005
         'XGBOOST': {
-            'n_estimators': [100, 200, 300, 500],        # 保持不变，范围合理
-            'max_depth': [3, 4, 5, 6],                   # 保持不变，范围合理
-            'learning_rate': [0.005, 0.01, 0.03, 0.05, 0.1],  # 向下扩展（0.01命中下界）
-            'subsample': [0.7, 0.8, 0.9, 1.0],          # 保持不变，范围合理
-            'colsample_bytree': [0.5, 0.6, 0.7, 0.8],   # 保持不变，范围合理
-            'reg_alpha': [0, 0.01, 0.1, 0.5, 1.0, 3.0], # 扩展上界（1.0命中上界），补充0.5中间值
-            'reg_lambda': [0.1, 0.5, 1.0, 3.0, 5.0, 8.0, 10.0],  # 扩展上界（5.0命中上界）
-            'min_child_weight': [3, 5, 10, 15],          # 保持不变，范围合理
+            'n_estimators': [100, 200, 300, 500],
+            'max_depth': [3, 4, 5, 6],
+            'learning_rate': [0.005, 0.01, 0.03, 0.05, 0.1],
+            'subsample': [0.7, 0.8, 0.9, 1.0],
+            'colsample_bytree': [0.5, 0.6, 0.7, 0.8],
+            'reg_alpha': [0, 0.01, 0.1, 0.5, 1.0, 3.0],
+            'reg_lambda': [0.1, 0.5, 1.0, 3.0, 5.0, 8.0, 10.0],
+            'min_child_weight': [3, 5, 10, 15],
         },
-        # LightGBM: 重点优化 lr与n_estimators耦合、正则化、num_leaves
-        # 原 lr=0.01时n_estimators=300远不够（有效学习量仅3）
-        # 原 reg_lambda=0 两次命中下界（完全无L2正则化）
-        # 原 num_leaves=50 对2422训练样本偏大
         'LightGBM': {
-            'n_estimators': [200, 300, 500, 800],        # 大幅扩展，适配低lr
-            'max_depth': [4, 6, 8, -1],                  # -1不限制，由num_leaves控制
-            'learning_rate': [0.01, 0.03, 0.05, 0.08, 0.1],  # 细化中间区域
-            'subsample': [0.7, 0.8, 0.9, 1.0],          # 扩展上界
-            'colsample_bytree': [0.5, 0.6, 0.7, 0.8],   # 向下扩展
-            'reg_alpha': [0, 0.01, 0.1, 1.0],           # 细化低正则化区域
-            'reg_lambda': [0, 0.1, 0.5, 1.0, 3.0],     # 细化（原0频繁命中下界）
-            'num_leaves': [15, 20, 31, 40],              # 降低上限（原50偏大）
-            'min_child_samples': [10, 20, 30],           # 保持不变，范围合理
+            'n_estimators': [200, 300, 500, 800],
+            'max_depth': [4, 6, 8, -1],
+            'learning_rate': [0.01, 0.03, 0.05, 0.08, 0.1],
+            'subsample': [0.7, 0.8, 0.9, 1.0],
+            'colsample_bytree': [0.5, 0.6, 0.7, 0.8],
+            'reg_alpha': [0, 0.01, 0.1, 1.0],
+            'reg_lambda': [0, 0.1, 0.5, 1.0, 3.0],
+            'num_leaves': [15, 20, 31, 40],
+            'min_child_samples': [10, 20, 30],
         },
     }
     return param_grids
 
-
 def get_base_models():
-    """返回各模型的基础实例（用于 RandomizedSearchCV）"""
+    """返回各模型的基础实例"""
     models = {
         'GBDT': GradientBoostingRegressor(random_state=RANDOM_STATE),
         'RF': RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=N_JOBS),
@@ -231,7 +273,6 @@ def get_base_models():
         'LightGBM': LGBMRegressor(random_state=RANDOM_STATE, verbose=-1, n_jobs=N_JOBS),
     }
     return models
-
 
 # ============ 计算评估指标 ============
 def compute_metrics(y_true, y_pred):
@@ -242,7 +283,6 @@ def compute_metrics(y_true, y_pred):
     r2 = r2_score(y_true, y_pred)
     return {'MAE': mae, 'MSE': mse, 'RMSE': rmse, 'R²': r2}
 
-
 # ============ OLS 回归 ============
 def ols_fit_predict(X_train, y_train, X_test):
     """使用 statsmodels 进行 OLS 回归"""
@@ -252,15 +292,9 @@ def ols_fit_predict(X_train, y_train, X_test):
     y_pred = model.predict(X_test_const)
     return y_pred, model
 
-
-# ============ 超参数调优（核心） ============
+# ============ 超参数调优 ============
 def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
-    """
-    使用带进度条的超参数搜索在训练集上进行调优
-    - 手动实现随机搜索 + tqdm 进度条
-    - 内层5折交叉验证
-    - 评分指标: MSE（越小越好）
-    """
+    """使用带进度条的超参数搜索"""
     from sklearn.model_selection import ParameterSampler, cross_val_score
 
     total_combos = int(np.prod([len(v) for v in param_grid.values()]))
@@ -269,16 +303,13 @@ def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
 
     inner_cv = KFold(n_splits=INNER_CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
-    # 生成随机参数组合
     param_list = list(ParameterSampler(
         param_grid, n_iter=n_iter, random_state=RANDOM_STATE
     ))
 
     best_score = -np.inf
     best_params = None
-    best_estimator = None
 
-    # 带进度条的搜索（delay=0.5s 防止进度条提前渲染到终端）
     sys.stdout.flush()
     pbar = tqdm(
         param_list,
@@ -290,10 +321,7 @@ def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
     )
 
     for params in pbar:
-        # 克隆模型并设置参数
         model_clone = base_model.__class__(**{**base_model.get_params(), **params})
-
-        # 内层交叉验证评分
         scores = cross_val_score(
             model_clone, X_train, y_train,
             cv=inner_cv,
@@ -302,17 +330,14 @@ def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
         )
         mean_score = scores.mean()
 
-        # 更新最优（neg_mse 越大越好，即 MSE 越小越好）
         if mean_score > best_score:
             best_score = mean_score
             best_params = params
 
-        # 进度条显示当前最优 MSE
         pbar.set_postfix({'最优MSE': f'{-best_score:.4f}'})
 
     pbar.close()
 
-    # 用最优参数在全部训练集上重新训练
     best_estimator = base_model.__class__(**{**base_model.get_params(), **best_params})
     best_estimator.fit(X_train, y_train)
 
@@ -321,10 +346,6 @@ def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
     log(f"    最优参数: {best_params}")
 
     return best_estimator, best_params, best_cv_mse
-
-
-
-
 
 # ============ 结果表格输出 ============
 def format_results_table(all_metrics, target_name):
@@ -336,7 +357,6 @@ def format_results_table(all_metrics, target_name):
     for metric in metric_names:
         row = [metric]
         values = [all_metrics[m][metric] for m in model_names]
-
         best_idx = np.argmax(values) if metric == 'R²' else np.argmin(values)
 
         for i, val in enumerate(values):
@@ -349,12 +369,11 @@ def format_results_table(all_metrics, target_name):
     headers = ['指标'] + model_names
     return headers, table_data
 
-
 def print_and_save_table(headers, table_data, target_name, output_path):
     """打印并保存表格"""
-    log(f"\n{'='*80}")
+    log(f"\n{'=' * 80}")
     log(f"  {target_name}")
-    log(f"{'='*80}")
+    log(f"{'=' * 80}")
     table_str = tabulate(table_data, headers=headers, tablefmt='grid', stralign='center')
     log(table_str)
 
@@ -368,10 +387,9 @@ def print_and_save_table(headers, table_data, target_name, output_path):
     log(f"  结果表格已保存: {output_path}")
     return df_result
 
-
 # ============ 特征重要性分析 ============
 def analyze_feature_importance(best_model, model_name, feature_cols, target_name, X_train, y_train):
-    """使用调优后的最佳模型分析特征重要性（仅输出文本和CSV，绘图由 plot_shap.py 负责）"""
+    """特征重要性分析"""
     if not hasattr(best_model, 'feature_importances_'):
         log(f"  {model_name} 不支持特征重要性分析，跳过")
         return None
@@ -393,10 +411,9 @@ def analyze_feature_importance(best_model, model_name, feature_cols, target_name
 
     return feat_imp
 
-
 # ============ OLS 回归摘要 ============
 def ols_summary(X_train, y_train, feature_cols, target_name):
-    """输出 OLS 回归的详细统计摘要（基于训练集）"""
+    """输出 OLS 回归的详细统计摘要"""
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_train)
     X_const = sm.add_constant(X_scaled)
@@ -410,25 +427,18 @@ def ols_summary(X_train, y_train, feature_cols, target_name):
         f.write(str(model.summary()) + "\n\n")
         f.write("特征名称对照:\n")
         for i, col in enumerate(feature_cols):
-            f.write(f"  x{i+1} -> {col}\n")
+            f.write(f"  x{i + 1} -> {col}\n")
 
     log(f"\n  OLS 回归摘要已保存: {summary_path}")
     log(f"  训练集 R² = {model.rsquared:.4f}, Adj. R² = {model.rsquared_adj:.4f}")
     return model
 
-
 # ============ 最优参数的保存与加载 ============
 BEST_PARAMS_DIR = os.path.join(BASE_DIR, 'best_params')
 os.makedirs(BEST_PARAMS_DIR, exist_ok=True)
 
-
 def save_best_params(all_best_params, target_name):
-    """
-    保存所有模型的最优超参数
-    - CSV 格式：方便人工查看
-    - JSON 格式：方便程序加载（推理模式使用）
-    """
-    # 1. 保存为 CSV（人工可读）
+    """保存最优超参数（CSV + JSON）"""
     rows = []
     for model_name, params in all_best_params.items():
         if params is None:
@@ -442,8 +452,6 @@ def save_best_params(all_best_params, target_name):
     df.to_csv(csv_path, index=False, encoding='utf-8-sig')
     log(f"  最优参数(CSV)已保存: {csv_path}")
 
-    # 2. 保存为 JSON（程序可加载，推理模式使用）
-    # 将 numpy 类型转为 Python 原生类型，确保 JSON 可序列化
     serializable_params = {}
     for model_name, params in all_best_params.items():
         if params is None:
@@ -461,12 +469,8 @@ def save_best_params(all_best_params, target_name):
         json.dump(serializable_params, f, ensure_ascii=False, indent=2)
     log(f"  最优参数(JSON)已保存: {json_path}")
 
-
 def load_best_params(target_name):
-    """
-    从 JSON 文件加载已保存的最优超参数（推理模式使用）
-    返回: {model_name: {param_name: value}} 或 None（文件不存在时）
-    """
+    """从 JSON 文件加载已保存的最优超参数"""
     json_path = os.path.join(BEST_PARAMS_DIR, f'best_params_{target_name}.json')
     if not os.path.exists(json_path):
         return None
@@ -476,7 +480,6 @@ def load_best_params(target_name):
 
     log(f"  已加载最优参数: {json_path}")
     return params
-
 
 # ============ 根据最优参数创建模型实例 ============
 def create_model_with_params(model_name, params):
@@ -491,7 +494,6 @@ def create_model_with_params(model_name, params):
         return LGBMRegressor(random_state=RANDOM_STATE, verbose=-1, n_jobs=N_JOBS, **params)
     else:
         raise ValueError(f"未知模型: {model_name}")
-
 
 # ============ 命令行参数解析 ============
 def parse_args():
@@ -508,8 +510,16 @@ def parse_args():
             '  infer — 推理模式：加载已保存的最优参数，跳过调参直接训练评估'
         )
     )
+    parser.add_argument(
+        '--targets', type=str, nargs='*', default=None,
+        help=(
+            '指定因变量（可多选，空格分隔）:\n'
+            '  --targets 步行比例              → 仅运行步行比例\n'
+            '  --targets 步行比例 步行距离      → 同时运行两个\n'
+            '  不指定则进入交互式选择模式'
+        )
+    )
     return parser.parse_args()
-
 
 # ============ 主函数 ============
 def main():
@@ -522,6 +532,15 @@ def main():
 
     total_start = time.time()
 
+    # ========== 确定因变量 ==========
+    if args.targets:
+        # 命令行指定
+        target_cols = args.targets
+        log(f"命令行指定因变量: {target_cols}")
+    else:
+        # 交互式选择
+        target_cols = interactive_select_targets()
+
     log("=" * 80)
     if infer_mode:
         log("  步行活力与步行范围的多模型对比实验【推理模式】")
@@ -531,11 +550,13 @@ def main():
         log("  流程: 数据划分 → 超参数调优(内层5折CV) → 测试集评估")
     log("=" * 80)
     log(f"  运行模式: {'推理模式 (--mode infer)' if infer_mode else '调优模式 (--mode tune)'}")
+    log(f"  因变量: {target_cols}")
     log(f"  实验开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"  日志文件: {log_path}")
 
-    # 1. 加载数据
-    X, y_a, y_b, feature_cols = load_data()
+    # 1. 加载数据（传入因变量列表，用于确定自变量）
+    df, feature_cols = load_data(target_cols)
+    X = df[feature_cols].values
 
     # 2. 调优模式：获取模型和参数搜索空间
     if not infer_mode:
@@ -548,16 +569,14 @@ def main():
             actual = min(N_ITER_SEARCH, total)
             log(f"  {name}: 总共 {total} 种组合, 将随机采样 {actual} 种")
 
-    # 3. 对两个因变量分别进行实验
-    targets = {
-TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
-        TARGET_B: (y_b, '模型B：步行距离（步行范围的限制）')
-    }
+    # 3. 对每个选择的因变量分别进行实验
+    for target_col in target_cols:
+        y = df[target_col].values
+        description = TARGET_DESCRIPTIONS.get(target_col, f'模型：{target_col}')
 
-    for target_col, (y, description) in targets.items():
-        log(f"\n\n{'#'*80}")
+        log(f"\n\n{'#' * 80}")
         log(f"  {description}")
-        log(f"{'#'*80}")
+        log(f"{'#' * 80}")
 
         # ========== 推理模式：加载已保存的最优参数 ==========
         loaded_params = None
@@ -565,7 +584,7 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
             loaded_params = load_best_params(target_col)
             if loaded_params is None:
                 log(f"  ❌ 错误: 未找到 {target_col} 的最优参数文件！")
-                log(f"     请先运行调优模式: python experiment.py --mode tune")
+                log(f"     请先运行调优模式: python experiment.py --mode tune --targets {target_col}")
                 log(f"     参数文件应位于: {BEST_PARAMS_DIR}/best_params_{target_col}.json")
                 continue
             log("  已加载的最优参数:")
@@ -583,21 +602,21 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
         log(f"  因变量统计 — 训练集: mean={y_train.mean():.4f}, std={y_train.std():.4f}")
         log(f"  因变量统计 — 测试集: mean={y_test.mean():.4f}, std={y_test.std():.4f}")
 
-        # 标准化（基于训练集拟合）
+        # 标准化
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
 
         # 存储结果
-        test_metrics = {}       # 测试集指标
-        test_predictions = {}   # 测试集预测值
-        all_best_params = {}    # 最优参数
-        best_trained_models = {}  # 训练好的最佳模型
+        test_metrics = {}
+        test_predictions = {}
+        all_best_params = {}
+        best_trained_models = {}
 
-        # ========== 步骤2: OLS（无超参数调优） ==========
-        log(f"\n  {'─'*60}")
+        # ========== 步骤2: OLS ==========
+        log(f"\n  {'─' * 60}")
         log(f"  [1/5] OLS 回归（无超参数，直接训练）")
-        log(f"  {'─'*60}")
+        log(f"  {'─' * 60}")
 
         ols_start = time.time()
         y_pred_test_ols, ols_model = ols_fit_predict(X_train_scaled, y_train, X_test_scaled)
@@ -613,12 +632,11 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
         # ========== 步骤3: 树模型 ==========
         model_list = ['GBDT', 'RF', 'XGBOOST', 'LightGBM']
         for idx, model_name in enumerate(model_list):
-            log(f"\n  {'─'*60}")
+            log(f"\n  {'─' * 60}")
 
             if infer_mode:
-                # ===== 推理模式：直接用已保存的最优参数训练 =====
-                log(f"  [{idx+2}/5] {model_name} — 推理模式（加载最优参数直接训练）")
-                log(f"  {'─'*60}")
+                log(f"  [{idx + 2}/5] {model_name} — 推理模式（加载最优参数直接训练）")
+                log(f"  {'─' * 60}")
 
                 best_params = loaded_params.get(model_name)
                 if best_params is None:
@@ -628,7 +646,6 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
                 log(f"    使用参数: {best_params}")
                 start_time = time.time()
 
-                # 用最优参数创建模型并训练
                 best_model = create_model_with_params(model_name, best_params)
                 best_model.fit(X_train_scaled, y_train)
 
@@ -636,9 +653,8 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
                 log(f"    训练耗时: {elapsed:.1f}秒")
 
             else:
-                # ===== 调优模式：超参数搜索 =====
-                log(f"  [{idx+2}/5] {model_name} — 超参数调优中...")
-                log(f"  {'─'*60}")
+                log(f"  [{idx + 2}/5] {model_name} — 超参数调优中...")
+                log(f"  {'─' * 60}")
 
                 start_time = time.time()
 
@@ -662,15 +678,12 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
             log(f"    测试集: MAE={m['MAE']:.4f}  MSE={m['MSE']:.4f}  RMSE={m['RMSE']:.4f}  R²={m['R²']:.4f}")
 
         # ========== 步骤4: 输出结果 ==========
-        # 4.1 测试集性能对比表格
         headers, table_data = format_results_table(test_metrics, target_col)
         csv_path = os.path.join(OUTPUT_DIR, f'model_comparison_test_{target_col}.csv')
         print_and_save_table(headers, table_data, f'{description} — 测试集性能对比', csv_path)
 
-        # 4.2 保存最优参数（调优模式和推理模式都保存，确保一致性）
         save_best_params(all_best_params, target_col)
 
-        # 4.3 特征重要性分析（使用测试集表现最好的树模型）
         if best_trained_models:
             best_tree_name = max(
                 [n for n in model_list if n in test_metrics],
@@ -682,22 +695,21 @@ TARGET_A: (y_a, '模型A：步行比例（步行活力的形成）'),
                 feature_cols, target_col, X_train_scaled, y_train
             )
 
-        # 4.4 OLS 回归摘要
         ols_summary(X_train, y_train, feature_cols, target_col)
 
     total_elapsed = time.time() - total_start
-    log(f"\n\n{'='*80}")
+    log(f"\n\n{'=' * 80}")
     log(f"  所有实验完成！")
     log(f"  运行模式: {'推理模式' if infer_mode else '调优模式'}")
-    log(f"  总耗时: {total_elapsed:.1f}秒 ({total_elapsed/60:.1f}分钟)")
+    log(f"  因变量: {target_cols}")
+    log(f"  总耗时: {total_elapsed:.1f}秒 ({total_elapsed / 60:.1f}分钟)")
     log(f"  结果保存在: {OUTPUT_DIR}")
     log(f"  日志文件: {log_path}")
     log(f"  实验结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     if not infer_mode:
-        log(f"  💡 下次可用推理模式快速运行: python experiment.py --mode infer")
+        log(f"  💡 下次可用推理模式快速运行: python experiment.py --mode infer --targets {' '.join(target_cols)}")
     log(f"  📊 绘制 SHAP 图例请运行: python plot_shap.py")
-    log(f"{'='*80}")
-
+    log(f"{'=' * 80}")
 
 if __name__ == '__main__':
     main()
