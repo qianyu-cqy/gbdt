@@ -343,8 +343,8 @@ def _plot_1a_r2_bar(test_results, target_name, shap_model_name, theme, save_path
     ax.set_title(f'{target_name} — 多模型 R² 对比', fontsize=13, fontweight='bold')
     ax.set_ylim(0, max(r2_values) * 1.15)
     ax.grid(True, alpha=0.3, axis='y')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(True)
+    ax.spines['right'].set_visible(True)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -713,7 +713,7 @@ def _plot_single_dependence(feat, feat_vals, shap_vals, theme, target_name, save
     ax.axhline(y=0, color=theme['primary'], linestyle='--', linewidth=1, alpha=0.6, zorder=3)
 
     ax.set_xlabel(f'{feat}', fontsize=11)
-    ax.set_ylabel(f'SHAP value for\n{feat}', fontsize=11)
+    ax.set_ylabel('SHAP value', fontsize=11)
     ax.set_xlim(plot_xmin, plot_xmax)
     ax.grid(True, alpha=0.2, zorder=1)
     ax.spines['top'].set_visible(False)
