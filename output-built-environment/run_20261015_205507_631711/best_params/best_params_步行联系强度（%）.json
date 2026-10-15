@@ -1,0 +1,39 @@
+{
+  "OLS": null,
+  "GBDT": {
+    "subsample": 0.8,
+    "n_estimators": 500,
+    "min_samples_split": 10,
+    "min_samples_leaf": 10,
+    "max_depth": 6,
+    "learning_rate": 0.03
+  },
+  "RF": {
+    "n_estimators": 300,
+    "min_samples_split": 5,
+    "min_samples_leaf": 5,
+    "max_features": 0.7,
+    "max_depth": null
+  },
+  "XGBOOST": {
+    "subsample": 0.9,
+    "reg_lambda": 10.0,
+    "reg_alpha": 0.5,
+    "n_estimators": 500,
+    "min_child_weight": 5,
+    "max_depth": 6,
+    "learning_rate": 0.05,
+    "colsample_bytree": 0.5
+  },
+  "LightGBM": {
+    "subsample": 0.9,
+    "reg_lambda": 3.0,
+    "reg_alpha": 0,
+    "num_leaves": 40,
+    "n_estimators": 500,
+    "min_child_samples": 10,
+    "max_depth": -1,
+    "learning_rate": 0.05,
+    "colsample_bytree": 0.8
+  }
+}

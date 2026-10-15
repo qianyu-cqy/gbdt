@@ -27,7 +27,7 @@ SHAP 图例绘制脚本
 使用方式：
   python plot_shap.py                    # 绘制所有图例
   python plot_shap.py --plots 1 2 3      # 只绘制指定编号的图例（1-11）
-  python plot_shap.py --target 步行分担率  # 只绘制指定因变量的图例
+  python plot_shap.py --target 步行联系强度（%）  # 只绘制指定因变量的图例
   python plot_shap.py --plots 12         # 只绘制SHAP特征影响-交互网络图
 """
 
@@ -68,14 +68,13 @@ warnings.filterwarnings('ignore')
 
 # ============ 配置（与 experiment.py 保持一致） ============
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, 'data-0828.csv')
-OUTPUT_DIR = os.path.join(BASE_DIR, 'output-0828')
+DATA_PATH = os.path.join(BASE_DIR, '建成环境数据.csv')
+OUTPUT_DIR = os.path.join(BASE_DIR, 'output-built-environment')
 BEST_PARAMS_DIR = os.path.join(OUTPUT_DIR, 'best_params')
 PLOT_DIR = os.path.join(OUTPUT_DIR, 'plots')
-os.makedirs(PLOT_DIR, exist_ok=True)
 
-TARGET_A = '步行分担率'
-TARGET_B = '步行联系度'
+TARGET_A = '步行联系强度（%）'
+TARGET_B = '步行联系收缩度'
 ALL_TARGETS = [TARGET_A, TARGET_B]
 ALWAYS_EXCLUDE = ['FID']
 TEST_SIZE = 0.2
@@ -83,11 +82,10 @@ RANDOM_STATE = 42
 N_JOBS = -1
 
 # ============ SHAP 分析模型配置 ============
-# 为每个因变量指定用于 SHAP 分析的模型（可选: 'XGBOOST' 或 'LightGBM'）
-# 根据实验结果选择各因变量表现最优的模型
+# auto 从本轮训练摘要选用内层CV MSE最低的树模型
 SHAP_MODEL_CONFIG = {
-    TARGET_A: 'XGBOOST',
-    TARGET_B: 'LightGBM',
+    TARGET_A: 'auto',
+    TARGET_B: 'auto',
 }
 
 # SHAP 依赖图选取的 Top 特征数量
@@ -115,7 +113,7 @@ _CMAP_VIRIDIS_SEQUENTIAL = plt.cm.viridis
 # 颜色节点: 深蓝色（最高值） → 青色 → 浅绿色 → 米黄色（中间值） → 浅橙色 → 深红色（最低值）
 _CMAP_RDBU_DIVERGING = plt.cm.RdBu_r
 
-# 主题一配置（Viridis - 用于步行联系度）
+# 主题一配置（Viridis - 用于步行联系收缩度）
 THEME_VAR1 = {
     'cmap_diverging': _CMAP_VIRIDIS_SEQUENTIAL,
     'cmap_sequential': _CMAP_VIRIDIS_SEQUENTIAL,
@@ -153,7 +151,7 @@ THEME_VAR2 = {
 
 def get_theme(target_name):
     """获取指定 TARGET 的主题色配置，第一个变量用Viridis，第二个用RdBu"""
-    if target_name == "步行分担率":
+    if target_name == TARGET_A:
         return THEME_VAR2
     else:
         return THEME_VAR1
@@ -277,7 +275,7 @@ def load_data(current_targets):
     加载数据并返回特征矩阵、因变量字典、特征名。
     current_targets: 当前脚本运行需要生成的因变量列表
     """
-    df = pd.read_csv(DATA_PATH, encoding='utf-8')
+    df = pd.read_csv(DATA_PATH, encoding='utf-8-sig')
 
     # 检查当前请求的因变量是否存在
     missing = [t for t in current_targets if t not in df.columns]
@@ -287,10 +285,17 @@ def load_data(current_targets):
 
     # 修改逻辑：始终排除【所有】已知的因变量候选集，而不仅仅是当前分析的那个
     # 这样可以确保“分析 A 时排除 B，分析 B 时排除 A”
-    exclude_cols = ALWAYS_EXCLUDE + ALL_TARGETS
+    exclude_cols = ALWAYS_EXCLUDE + ALL_TARGETS + list(current_targets)
 
     # 动态获取特征列（确保这些列确实存在于 df 中）
     feature_cols = [c for c in df.columns if c not in exclude_cols]
+
+    # 与训练流程使用相同的数据清理。
+    df = df.dropna().reset_index(drop=True)
+    numeric_cols = feature_cols + list(current_targets)
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='raise')
+    if not np.isfinite(df[numeric_cols].to_numpy()).all():
+        raise ValueError('特征或目标中含有无穷值')
 
     # 提取特征矩阵 X
     X = df[feature_cols].values
@@ -321,11 +326,11 @@ def create_model_with_params(model_name, params):
     if model_name == 'GBDT':
         return GradientBoostingRegressor(random_state=RANDOM_STATE, **params)
     elif model_name == 'RF':
-        return RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=N_JOBS, **params)
+        return RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=1, **params)
     elif model_name == 'XGBOOST':
-        return XGBRegressor(random_state=RANDOM_STATE, verbosity=0, n_jobs=N_JOBS, **params)
+        return XGBRegressor(random_state=RANDOM_STATE, verbosity=0, n_jobs=1, **params)
     elif model_name == 'LightGBM':
-        return LGBMRegressor(random_state=RANDOM_STATE, verbose=-1, n_jobs=N_JOBS, **params)
+        return LGBMRegressor(random_state=RANDOM_STATE, verbose=-1, n_jobs=1, **params)
     else:
         raise ValueError(f"未知模型: {model_name}")
 
@@ -1270,13 +1275,13 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
     fig.set_facecolor('white')
 
     # 根据因变量名称动态设定渐变色列表
-    if target_name == "步行分担率":
-        # 步行分担率：边=红色渐变，节点=蓝色渐变
+    if target_name == TARGET_A:
+        # 步行联系强度（%）：边=红色渐变，节点=蓝色渐变
         edge_colors_list = ['#FFF5F0', '#FCBBA1', '#FB6A4A', '#CB181D', '#67000D']
         node_colors_list = ['#F7FBFF', '#DEEBF7', '#6BAED6', '#2171B5', '#08306B']
         vint_label, vimp_label = '交互强度 (Vint)', '特征影响 (Vimp)'
     else:
-        # 步行联系度：边=紫色渐变，节点=黄色渐变
+        # 步行联系收缩度：边=紫色渐变，节点=黄色渐变
         edge_colors_list = ['#F0E6FF', '#C9A0DC', '#9B59B6', '#6C3483', '#2E0854']
         node_colors_list = ['#FFFFE5', '#FFF7BC', '#FEE391', '#FEC44F', '#CC4C02']
         vint_label, vimp_label = '交互强度 (Vint)', '特征影响 (Vimp)'
@@ -1444,7 +1449,13 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None, max_fea
     log.info(f"  SHAP 分析将基于全量样本进行，样本总数: {X_all_scaled.shape[0]}")
 
     # 获取 SHAP 分析所用的模型
-    shap_model_name = SHAP_MODEL_CONFIG.get(target_name, 'XGBOOST')
+    shap_model_name = SHAP_MODEL_CONFIG.get(target_name, 'auto')
+    if shap_model_name == 'auto':
+        with open(os.path.join(OUTPUT_DIR, 'training_summary.json'), 'r', encoding='utf-8') as f:
+            summary = json.load(f)
+        shap_model_name = summary['results'][target_name]['best_cv_tree_model']
+        if not shap_model_name:
+            raise ValueError('缺少本轮交叉验证结果，请先运行调优模式')
     shap_model = trained_models.get(shap_model_name)
     if shap_model is None:
         log.error(f"  未找到 {shap_model_name} 模型，无法进行 SHAP 分析")
@@ -1568,8 +1579,8 @@ def parse_args():
         '--target', type=str, nargs='+', default=None,
         help=(
             '指定因变量（可多选，空格分隔）\n'
-            '例如: --target 步行分担率\n'
-            '      --target 步行分担率 步行联系度\n'
+            '例如: --target 步行联系强度（%%）\n'
+            '      --target 步行联系强度（%%） 步行联系收缩度\n'
             '不指定则自动检测数据中可用的因变量'
         )
     )
@@ -1577,11 +1588,18 @@ def parse_args():
         '--max-features', type=int, default=None,
         help='限制图4输出的前 N 个特征；不指定则输出全部特征'
     )
+    parser.add_argument('--output-dir', type=str, required=True,
+                        help='本轮训练结果目录（含 best_params 和 training_summary.json）')
     return parser.parse_args()
 
 
 def main():
+    global OUTPUT_DIR, BEST_PARAMS_DIR, PLOT_DIR
     args = parse_args()
+    OUTPUT_DIR = os.path.abspath(args.output_dir)
+    BEST_PARAMS_DIR = os.path.join(OUTPUT_DIR, 'best_params')
+    PLOT_DIR = os.path.join(OUTPUT_DIR, 'plots')
+    os.makedirs(PLOT_DIR, exist_ok=True)
 
     log.info("=" * 70)
     log.info("  SHAP 图例绘制脚本")
@@ -1598,7 +1616,7 @@ def main():
     if args.target:
         current_run_targets = args.target
     else:
-        df_head = pd.read_csv(DATA_PATH, encoding='utf-8', nrows=0)
+        df_head = pd.read_csv(DATA_PATH, encoding='utf-8-sig', nrows=0)
         current_run_targets = [t for t in ALL_TARGETS if t in df_head.columns]
 
     # 2. 调用修改后的加载函数

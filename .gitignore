@@ -9,3 +9,11 @@ __pycache__/
 /output-0828.zip
 /output-0828/*
 !/output-0828/best_params/
+# Keep this run's parameters and reproducibility metadata in Git
+/output-built-environment/*
+!/output-built-environment/run_20261015_205507_631711/
+/output-built-environment/run_20261015_205507_631711/*
+!/output-built-environment/run_20261015_205507_631711/best_params/
+!/output-built-environment/run_20261015_205507_631711/best_params_*.csv
+!/output-built-environment/run_20261015_205507_631711/training_summary.json
+!/output-built-environment/run_20261015_205507_631711/data_split.csv

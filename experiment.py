@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-步行分担率与步行联系度的多模型对比实验（改进版 v2）
+步行联系强度（%）与步行联系收缩度的多模型对比实验（改进版 v2）
 =============================================
 支持动态选择因变量：
-  --targets 步行分担率              → 仅运行步行分担率模型
-  --targets 步行分担率 步行联系度    → 同时运行两个模型
-  --targets 步行联系度              → 仅运行步行联系度模型
+  --targets 步行联系强度（%）              → 仅运行步行联系强度（%）模型
+  --targets 步行联系强度（%） 步行联系收缩度    → 同时运行两个模型
+  --targets 步行联系收缩度              → 仅运行步行联系收缩度模型
 
 实验流程：
   1. 数据 80/20 划分为训练集和测试集（测试集完全隔离）
-  2. 在训练集上使用 RandomizedSearchCV（内层5折交叉验证）进行超参数调优
+  2. 在训练集上使用 随机参数采样（内层5折交叉验证）进行超参数调优
   3. 使用最优参数在完整训练集上重新训练
   4. 在 hold-out 测试集上评估最终性能（MAE、MSE、RMSE、R²）
 
@@ -23,6 +23,8 @@ import json
 import time
 import logging
 import argparse
+import hashlib
+from pathlib import Path
 import warnings
 from datetime import datetime
 
@@ -38,7 +40,7 @@ rcParams['font.sans-serif'] = ['STHeiti', 'Heiti TC', 'Songti SC', 'Arial Unicod
 rcParams['axes.unicode_minus'] = False
 
 from sklearn.model_selection import (
-    train_test_split, KFold, RandomizedSearchCV
+    train_test_split, KFold
 )
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -53,11 +55,9 @@ warnings.filterwarnings('ignore')
 
 # ============ 配置 ============
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, 'data-0828.csv')
-OUTPUT_DIR = os.path.join(BASE_DIR, 'output-0828')
+DATA_PATH = os.path.join(BASE_DIR, '建成环境数据.csv')
+OUTPUT_DIR = os.path.join(BASE_DIR, 'output-built-environment')
 LOG_DIR = os.path.join(OUTPUT_DIR, 'logs')
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
 
 # ============ 不再硬编码因变量，改为动态获取 ============
 ALWAYS_EXCLUDE = ['FID']  # 始终排除的列（非特征列）
@@ -66,16 +66,16 @@ TEST_SIZE = 0.2          # 测试集比例
 INNER_CV_FOLDS = 5       # 调参内层交叉验证折数
 N_ITER_SEARCH = 60       # RandomizedSearchCV 最大搜索次数
 RANDOM_STATE = 42
-N_JOBS = -1              # 并行核数
+N_JOBS = min(5, os.cpu_count() or 1)  # 仅并行CV，模型内部单线程
 
 # ============ 因变量描述映射（可扩展） ============
 TARGET_DESCRIPTIONS = {
-    '步行分担率': '模型A：步行分担率',
-    '步行联系度': '模型B：步行联系度（反映街区空间关联）',
+    '步行联系强度（%）': '模型A：步行联系强度（%）',
+    '步行联系收缩度': '模型B：步行联系收缩度',
 }
 
 # 定义所有潜在的因变量，用于在特征中互相排除
-ALL_TARGET_COLS = ['步行分担率', '步行联系度']
+ALL_TARGET_COLS = ['步行联系强度（%）', '步行联系收缩度']
 
 # ============ 日志系统 ============
 def setup_logger():
@@ -121,7 +121,7 @@ def load_data(target_cols):
     """
     加载并预处理数据
     """
-    df = pd.read_csv(DATA_PATH, encoding='utf-8')
+    df = pd.read_csv(DATA_PATH, encoding='utf-8-sig')
     log(f"数据维度: {df.shape}")
 
     # 检查当前请求的因变量是否存在
@@ -134,9 +134,15 @@ def load_data(target_cols):
 
     # 【关键修改】：排除列 = 始终排除的列 + 所有已知的潜在因变量
     # 这样当跑其中一个目标时，另一个目标也会被排除，避免目标泄漏。
-    exclude_cols = ALWAYS_EXCLUDE + ALL_TARGET_COLS
+    exclude_cols = ALWAYS_EXCLUDE + ALL_TARGET_COLS + list(target_cols)
     feature_cols = [c for c in df.columns if c not in exclude_cols]
 
+    if not feature_cols:
+        raise ValueError('没有可用的自变量')
+    numeric_cols = feature_cols + list(target_cols)
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='raise')
+    if not np.isfinite(df[numeric_cols].to_numpy()).all():
+        raise ValueError('特征或目标中含有无穷值')
     n_samples = df.shape[0]
     n_features = len(feature_cols)
     log(f"\n因变量: {target_cols}")
@@ -153,7 +159,7 @@ def detect_available_targets():
     """
     扫描数据文件，检测哪些已知因变量存在
     """
-    df_head = pd.read_csv(DATA_PATH, encoding='utf-8', nrows=0)
+    df_head = pd.read_csv(DATA_PATH, encoding='utf-8-sig', nrows=0)
     columns = df_head.columns.tolist()
 
     # 修改此处匹配新的变量名
@@ -176,7 +182,7 @@ def interactive_select_targets():
     print(f"\n已识别的可用因变量:")
 
     if not available:
-        print("  ⚠️ 未检测到已知因变量（步行分担率/步行联系度）")
+        print("  ⚠️ 未检测到已知因变量（步行联系强度（%）/步行联系收缩度）")
         print("  请手动输入因变量名称（用逗号分隔）:")
         user_input = input("  > ").strip()
         if not user_input:
@@ -257,9 +263,9 @@ def get_base_models():
     """返回各模型的基础实例"""
     models = {
         'GBDT': GradientBoostingRegressor(random_state=RANDOM_STATE),
-        'RF': RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=N_JOBS),
-        'XGBOOST': XGBRegressor(random_state=RANDOM_STATE, verbosity=0, n_jobs=N_JOBS),
-        'LightGBM': LGBMRegressor(random_state=RANDOM_STATE, verbose=-1, n_jobs=N_JOBS),
+        'RF': RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=1),
+        'XGBOOST': XGBRegressor(random_state=RANDOM_STATE, verbosity=0, n_jobs=1),
+        'LightGBM': LGBMRegressor(random_state=RANDOM_STATE, verbose=-1, n_jobs=1),
     }
     return models
 
@@ -282,7 +288,7 @@ def ols_fit_predict(X_train, y_train, X_test):
     return y_pred, model
 
 # ============ 超参数调优 ============
-def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
+def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train, target_name):
     """使用带进度条的超参数搜索"""
     from sklearn.model_selection import ParameterSampler, cross_val_score
 
@@ -298,6 +304,10 @@ def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
 
     best_score = -np.inf
     best_params = None
+    search_rows = []
+    search_dir = os.path.join(OUTPUT_DIR, 'cv_results')
+    os.makedirs(search_dir, exist_ok=True)
+    search_path = os.path.join(search_dir, f'{target_name}_{model_name}.csv')
 
     sys.stdout.flush()
     pbar = tqdm(
@@ -306,6 +316,7 @@ def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
         unit="组合",
         ncols=90,
         delay=0.5,
+        disable=not sys.stdout.isatty(),
         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
     )
 
@@ -315,9 +326,20 @@ def tune_hyperparameters(model_name, base_model, param_grid, X_train, y_train):
             model_clone, X_train, y_train,
             cv=inner_cv,
             scoring='neg_mean_squared_error',
-            n_jobs=N_JOBS
+            n_jobs=N_JOBS, error_score='raise'
         )
         mean_score = scores.mean()
+        if not np.isfinite(scores).all():
+            raise ValueError(f'{model_name} 交叉验证产生非有限指标')
+        search_rows.append({
+            'candidate': len(search_rows) + 1,
+            'params': json.dumps(params, ensure_ascii=False),
+            'mean_cv_mse': float(-mean_score), 'std_cv_mse': float(scores.std()),
+            **{f'fold_{i + 1}_mse': float(-score) for i, score in enumerate(scores)},
+        })
+        pd.DataFrame(search_rows).to_csv(search_path, index=False, encoding='utf-8-sig')
+        if len(search_rows) % 10 == 0:
+            log(f'    {model_name} 调参进度: {len(search_rows)}/{n_iter}')
 
         if mean_score > best_score:
             best_score = mean_score
@@ -424,7 +446,6 @@ def ols_summary(X_train, y_train, feature_cols, target_name):
 
 # ============ 最优参数的保存与加载 ============
 BEST_PARAMS_DIR = os.path.join(OUTPUT_DIR, 'best_params')
-os.makedirs(BEST_PARAMS_DIR, exist_ok=True)
 
 def save_best_params(all_best_params, target_name):
     """保存最优超参数（CSV + JSON）"""
@@ -476,18 +497,18 @@ def create_model_with_params(model_name, params):
     if model_name == 'GBDT':
         return GradientBoostingRegressor(random_state=RANDOM_STATE, **params)
     elif model_name == 'RF':
-        return RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=N_JOBS, **params)
+        return RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=1, **params)
     elif model_name == 'XGBOOST':
-        return XGBRegressor(random_state=RANDOM_STATE, verbosity=0, n_jobs=N_JOBS, **params)
+        return XGBRegressor(random_state=RANDOM_STATE, verbosity=0, n_jobs=1, **params)
     elif model_name == 'LightGBM':
-        return LGBMRegressor(random_state=RANDOM_STATE, verbose=-1, n_jobs=N_JOBS, **params)
+        return LGBMRegressor(random_state=RANDOM_STATE, verbose=-1, n_jobs=1, **params)
     else:
         raise ValueError(f"未知模型: {model_name}")
 
 # ============ 命令行参数解析 ============
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='步行分担率与步行联系度的多模型对比实验',
+        description='步行联系强度（%）与步行联系收缩度的多模型对比实验',
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument(
@@ -503,19 +524,39 @@ def parse_args():
         '--targets', type=str, nargs='*', default=None,
         help=(
             '指定因变量（可多选，空格分隔）:\n'
-            '  --targets 步行分担率              → 仅运行步行分担率\n'
-            '  --targets 步行分担率 步行联系度    → 同时运行两个\n'
+            '  --targets 步行联系强度（%%）              → 仅运行步行联系强度（%%）\n'
+            '  --targets 步行联系强度（%%） 步行联系收缩度    → 同时运行两个\n'
             '  不指定则进入交互式选择模式'
         )
     )
-    return parser.parse_args()
+    parser.add_argument('--output-dir', type=str, default=None,
+                        help='结果目录；调优默认新建时间戳目录，推理须指定已有目录')
+    parser.add_argument('--jobs', type=int, default=N_JOBS,
+                        help='交叉验证并行进程数（默认最多5个，模型内部单线程）')
+    args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error('--jobs 必须大于等于1')
+    if args.mode == 'infer' and not args.output_dir:
+        parser.error('推理模式须通过 --output-dir 指定已有结果目录')
+    return args
 
 # ============ 主函数 ============
 def main():
-    global logger
+    global logger, OUTPUT_DIR, LOG_DIR, BEST_PARAMS_DIR, N_JOBS
 
     args = parse_args()
     infer_mode = (args.mode == 'infer')
+    N_JOBS = args.jobs
+    if args.output_dir:
+        OUTPUT_DIR = os.path.abspath(args.output_dir)
+    else:
+        OUTPUT_DIR = os.path.join(OUTPUT_DIR, datetime.now().strftime('run_%Y%m%d_%H%M%S_%f'))
+    if not infer_mode and os.path.exists(OUTPUT_DIR) and os.listdir(OUTPUT_DIR):
+        raise FileExistsError(f'调优结果目录非空，拒绝覆盖: {OUTPUT_DIR}')
+    LOG_DIR = os.path.join(OUTPUT_DIR, 'logs')
+    BEST_PARAMS_DIR = os.path.join(OUTPUT_DIR, 'best_params')
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(BEST_PARAMS_DIR, exist_ok=True)
 
     logger, log_path = setup_logger()
 
@@ -532,10 +573,10 @@ def main():
 
     log("=" * 80)
     if infer_mode:
-        log("  步行分担率与步行联系度的多模型对比实验【推理模式】")
+        log("  步行联系强度（%）与步行联系收缩度的多模型对比实验【推理模式】")
         log("  流程: 加载最优参数 → 训练 → 测试集评估")
     else:
-        log("  步行分担率与步行联系度的多模型对比实验【调优模式】")
+        log("  步行联系强度（%）与步行联系收缩度的多模型对比实验【调优模式】")
         log("  流程: 数据划分 → 超参数调优(内层5折CV) → 测试集评估")
     log("=" * 80)
     log(f"  运行模式: {'推理模式 (--mode infer)' if infer_mode else '调优模式 (--mode tune)'}")
@@ -546,6 +587,34 @@ def main():
     # 1. 加载数据（传入因变量列表，用于确定自变量）
     df, feature_cols = load_data(target_cols)
     X = df[feature_cols].values
+    train_indices, test_indices = train_test_split(
+        np.arange(len(df)), test_size=TEST_SIZE, random_state=RANDOM_STATE
+    )
+    split = np.full(len(df), 'train', dtype=object)
+    split[test_indices] = 'test'
+    pd.DataFrame({'FID': df['FID'], 'split': split}).to_csv(
+        os.path.join(OUTPUT_DIR, 'data_split.csv'), index=False, encoding='utf-8-sig'
+    )
+    summary_path = os.path.join(OUTPUT_DIR, 'training_summary.json')
+    previous_results = {}
+    if infer_mode and os.path.exists(summary_path):
+        with open(summary_path, 'r', encoding='utf-8') as f:
+            previous_results = json.load(f).get('results', {})
+    run_summary = {
+        'status': 'running', 'mode': args.mode, 'data_file': DATA_PATH,
+        'data_sha256': hashlib.sha256(Path(DATA_PATH).read_bytes()).hexdigest(),
+        'started_at': datetime.now().isoformat(),
+        'n_samples': len(df), 'features': feature_cols, 'targets': target_cols,
+        'test_size': TEST_SIZE, 'random_state': RANDOM_STATE,
+        'cv_folds': INNER_CV_FOLDS, 'search_iterations': N_ITER_SEARCH,
+        'cv_jobs': N_JOBS, 'results': previous_results,
+    }
+    def save_summary():
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(run_summary, f, ensure_ascii=False, indent=2)
+    save_summary()
+    log(f'  本轮结果目录: {OUTPUT_DIR}')
+    log(f'  交叉验证并行进程数: {N_JOBS}；模型内部单线程')
 
     # 2. 调优模式：获取模型和参数搜索空间
     if not infer_mode:
@@ -584,9 +653,8 @@ def main():
                     log(f"    {m_name}: {m_params}")
 
         # ========== 步骤1: 划分训练集和测试集 ==========
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
-        )
+        X_train, X_test = X[train_indices], X[test_indices]
+        y_train, y_test = y[train_indices], y[test_indices]
         log(f"\n  数据划分: 训练集 {X_train.shape[0]} 样本, 测试集 {X_test.shape[0]} 样本")
         log(f"  因变量统计 — 训练集: mean={y_train.mean():.4f}, std={y_train.std():.4f}")
         log(f"  因变量统计 — 测试集: mean={y_test.mean():.4f}, std={y_test.std():.4f}")
@@ -601,6 +669,7 @@ def main():
         test_predictions = {}
         all_best_params = {}
         best_trained_models = {}
+        cv_mse = run_summary['results'].get(target_col, {}).get('best_cv_mse', {}) if infer_mode else {}
 
         # ========== 步骤2: OLS ==========
         log(f"\n  {'─' * 60}")
@@ -650,11 +719,12 @@ def main():
                 best_model, best_params, best_cv_mse = tune_hyperparameters(
                     model_name, base_models[model_name],
                     param_grids[model_name],
-                    X_train_scaled, y_train
+                    X_train_scaled, y_train, target_col
                 )
 
                 elapsed = time.time() - start_time
                 log(f"    调参耗时: {elapsed:.1f}秒")
+                cv_mse[model_name] = best_cv_mse
 
             # 在测试集上评估
             y_pred_test = best_model.predict(X_test_scaled)
@@ -672,6 +742,20 @@ def main():
         print_and_save_table(headers, table_data, f'{description} — 测试集性能对比', csv_path)
 
         save_best_params(all_best_params, target_col)
+        prediction_frame = pd.DataFrame({
+            'FID': df.iloc[test_indices]['FID'].to_numpy(), 'y_true': y_test,
+            **{name: pred[1] for name, pred in test_predictions.items()},
+        })
+        prediction_frame.to_csv(
+            os.path.join(OUTPUT_DIR, f'test_predictions_{target_col}.csv'),
+            index=False, encoding='utf-8-sig'
+        )
+        run_summary['results'][target_col] = {
+            'test_metrics': test_metrics, 'best_cv_mse': cv_mse,
+            'best_cv_tree_model': min(cv_mse, key=cv_mse.get) if cv_mse else None,
+            'best_test_tree_model': max(best_trained_models, key=lambda name: test_metrics[name]['R²']),
+        }
+        save_summary()
 
         if best_trained_models:
             best_tree_name = max(
@@ -687,6 +771,10 @@ def main():
         ols_summary(X_train, y_train, feature_cols, target_col)
 
     total_elapsed = time.time() - total_start
+    run_summary['status'] = 'completed'
+    run_summary['elapsed_seconds'] = total_elapsed
+    run_summary['finished_at'] = datetime.now().isoformat()
+    save_summary()
     log(f"\n\n{'=' * 80}")
     log(f"  所有实验完成！")
     log(f"  运行模式: {'推理模式' if infer_mode else '调优模式'}")
@@ -696,8 +784,8 @@ def main():
     log(f"  日志文件: {log_path}")
     log(f"  实验结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     if not infer_mode:
-        log(f"  💡 下次可用推理模式快速运行: python experiment.py --mode infer --targets {' '.join(target_cols)}")
-    log(f"  📊 绘制 SHAP 图例请运行: python plot_shap.py")
+        log(f"  💡 下次可用推理模式快速运行: python experiment.py --mode infer --output-dir \"{OUTPUT_DIR}\"")
+    log(f'  📊 绘制 SHAP 图例: python plot_shap.py --output-dir "{OUTPUT_DIR}"')
     log(f"{'=' * 80}")
 
 if __name__ == '__main__':
