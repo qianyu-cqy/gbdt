@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-步行活力与步行范围的多模型对比实验（改进版 v2）
+步行分担率与步行联系度的多模型对比实验（改进版 v2）
 =============================================
 支持动态选择因变量：
-  --targets 步行比例          → 仅运行步行比例模型
-  --targets 步行比例 步行距离  → 同时运行两个模型
-  --targets 步行距离          → 仅运行步行距离模型
+  --targets 步行分担率              → 仅运行步行分担率模型
+  --targets 步行分担率 步行联系度    → 同时运行两个模型
+  --targets 步行联系度              → 仅运行步行联系度模型
 
 实验流程：
   1. 数据 80/20 划分为训练集和测试集（测试集完全隔离）
@@ -53,14 +53,14 @@ warnings.filterwarnings('ignore')
 
 # ============ 配置 ============
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, 'new_data.csv')
-OUTPUT_DIR = os.path.join(BASE_DIR, 'results')
-LOG_DIR = os.path.join(BASE_DIR, 'logs')
+DATA_PATH = os.path.join(BASE_DIR, 'data-0828.csv')
+OUTPUT_DIR = os.path.join(BASE_DIR, 'output-0828')
+LOG_DIR = os.path.join(OUTPUT_DIR, 'logs')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # ============ 不再硬编码因变量，改为动态获取 ============
-ALWAYS_EXCLUDE = ['街区编号']  # 始终排除的列（非特征列）
+ALWAYS_EXCLUDE = ['FID']  # 始终排除的列（非特征列）
 
 TEST_SIZE = 0.2          # 测试集比例
 INNER_CV_FOLDS = 5       # 调参内层交叉验证折数
@@ -70,9 +70,12 @@ N_JOBS = -1              # 并行核数
 
 # ============ 因变量描述映射（可扩展） ============
 TARGET_DESCRIPTIONS = {
-    '步行比例': '模型A：步行比例（步行活力的形成）',
-    '步行距离': '模型B：步行距离（步行范围的限制）',
+    '步行分担率': '模型A：步行分担率',
+    '步行联系度': '模型B：步行联系度（反映街区空间关联）',
 }
+
+# 定义所有潜在的因变量，用于在特征中互相排除
+ALL_TARGET_COLS = ['步行分担率', '步行联系度']
 
 # ============ 日志系统 ============
 def setup_logger():
@@ -117,35 +120,21 @@ def log(msg=''):
 def load_data(target_cols):
     """
     加载并预处理数据
-
-    参数:
-        target_cols: list[str], 用户选择的因变量列表
-
-    返回:
-        df: 完整数据
-        feature_cols: 自变量列名列表
     """
     df = pd.read_csv(DATA_PATH, encoding='utf-8')
     log(f"数据维度: {df.shape}")
-    log(f"列名: {df.columns.tolist()}")
 
-    # 检查因变量是否存在
+    # 检查当前请求的因变量是否存在
     missing_targets = [t for t in target_cols if t not in df.columns]
     if missing_targets:
         log(f"\n❌ 错误: 以下因变量在数据中不存在: {missing_targets}")
-        log(f"   数据中可用的列: {df.columns.tolist()}")
         sys.exit(1)
-
-    missing = df.isnull().sum()
-    if missing.sum() > 0:
-        log(f"\n缺失值统计:\n{missing[missing > 0]}")
-    else:
-        log("无缺失值")
 
     df = df.dropna().reset_index(drop=True)
 
-    # 排除列 = 始终排除的列 + 所有因变量列
-    exclude_cols = ALWAYS_EXCLUDE + target_cols
+    # 【关键修改】：排除列 = 始终排除的列 + 所有已知的潜在因变量
+    # 这样当跑其中一个目标时，另一个目标也会被排除，避免目标泄漏。
+    exclude_cols = ALWAYS_EXCLUDE + ALL_TARGET_COLS
     feature_cols = [c for c in df.columns if c not in exclude_cols]
 
     n_samples = df.shape[0]
@@ -163,12 +152,12 @@ def load_data(target_cols):
 def detect_available_targets():
     """
     扫描数据文件，检测哪些已知因变量存在
-    用于交互式选择模式
     """
     df_head = pd.read_csv(DATA_PATH, encoding='utf-8', nrows=0)
     columns = df_head.columns.tolist()
 
-    known_targets = ['步行比例', '步行距离']
+    # 修改此处匹配新的变量名
+    known_targets = ALL_TARGET_COLS
     available = [t for t in known_targets if t in columns]
     return available, columns
 
@@ -187,7 +176,7 @@ def interactive_select_targets():
     print(f"\n已识别的可用因变量:")
 
     if not available:
-        print("  ⚠️ 未检测到已知因变量（步行比例/步行距离）")
+        print("  ⚠️ 未检测到已知因变量（步行分担率/步行联系度）")
         print("  请手动输入因变量名称（用逗号分隔）:")
         user_input = input("  > ").strip()
         if not user_input:
@@ -434,7 +423,7 @@ def ols_summary(X_train, y_train, feature_cols, target_name):
     return model
 
 # ============ 最优参数的保存与加载 ============
-BEST_PARAMS_DIR = os.path.join(BASE_DIR, 'best_params')
+BEST_PARAMS_DIR = os.path.join(OUTPUT_DIR, 'best_params')
 os.makedirs(BEST_PARAMS_DIR, exist_ok=True)
 
 def save_best_params(all_best_params, target_name):
@@ -498,7 +487,7 @@ def create_model_with_params(model_name, params):
 # ============ 命令行参数解析 ============
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='步行活力与步行范围的多模型对比实验',
+        description='步行分担率与步行联系度的多模型对比实验',
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument(
@@ -514,8 +503,8 @@ def parse_args():
         '--targets', type=str, nargs='*', default=None,
         help=(
             '指定因变量（可多选，空格分隔）:\n'
-            '  --targets 步行比例              → 仅运行步行比例\n'
-            '  --targets 步行比例 步行距离      → 同时运行两个\n'
+            '  --targets 步行分担率              → 仅运行步行分担率\n'
+            '  --targets 步行分担率 步行联系度    → 同时运行两个\n'
             '  不指定则进入交互式选择模式'
         )
     )
@@ -543,10 +532,10 @@ def main():
 
     log("=" * 80)
     if infer_mode:
-        log("  步行活力与步行范围的多模型对比实验【推理模式】")
+        log("  步行分担率与步行联系度的多模型对比实验【推理模式】")
         log("  流程: 加载最优参数 → 训练 → 测试集评估")
     else:
-        log("  步行活力与步行范围的多模型对比实验【调优模式】")
+        log("  步行分担率与步行联系度的多模型对比实验【调优模式】")
         log("  流程: 数据划分 → 超参数调优(内层5折CV) → 测试集评估")
     log("=" * 80)
     log(f"  运行模式: {'推理模式 (--mode infer)' if infer_mode else '调优模式 (--mode tune)'}")

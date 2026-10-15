@@ -1,3 +1,11 @@
 /results/
 /plots/
 .idea/
+# Local environment and generated experiment artifacts
+/.venv/
+__pycache__/
+/logs/
+/results.zip
+/output-0828.zip
+/output-0828/*
+!/output-0828/best_params/

@@ -27,7 +27,7 @@ SHAP 图例绘制脚本
 使用方式：
   python plot_shap.py                    # 绘制所有图例
   python plot_shap.py --plots 1 2 3      # 只绘制指定编号的图例（1-11）
-  python plot_shap.py --target 步行比例  # 只绘制指定因变量的图例
+  python plot_shap.py --target 步行分担率  # 只绘制指定因变量的图例
   python plot_shap.py --plots 12         # 只绘制SHAP特征影响-交互网络图
 """
 
@@ -46,9 +46,11 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
 import seaborn as sns
+import concurrent.futures
+from functools import partial
 
-# ============ 中文字体设置 ============
-rcParams['font.sans-serif'] = ['STHeiti', 'Heiti TC', 'Songti SC', 'Arial Unicode MS']
+# ============ 跨平台中文字体设置 ============
+rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 'STHeiti', 'DejaVu Sans']
 rcParams['axes.unicode_minus'] = False
 rcParams['figure.dpi'] = 150
 
@@ -66,14 +68,16 @@ warnings.filterwarnings('ignore')
 
 # ============ 配置（与 experiment.py 保持一致） ============
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, 'new_data.csv')
-BEST_PARAMS_DIR = os.path.join(BASE_DIR, 'best_params')
-PLOT_DIR = os.path.join(BASE_DIR, 'plots')
+DATA_PATH = os.path.join(BASE_DIR, 'data-0828.csv')
+OUTPUT_DIR = os.path.join(BASE_DIR, 'output-0828')
+BEST_PARAMS_DIR = os.path.join(OUTPUT_DIR, 'best_params')
+PLOT_DIR = os.path.join(OUTPUT_DIR, 'plots')
 os.makedirs(PLOT_DIR, exist_ok=True)
 
-TARGET_A = '步行比例'
-TARGET_B = '步行距离'
-ALWAYS_EXCLUDE = ['街区编号']
+TARGET_A = '步行分担率'
+TARGET_B = '步行联系度'
+ALL_TARGETS = [TARGET_A, TARGET_B]
+ALWAYS_EXCLUDE = ['FID']
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 N_JOBS = -1
@@ -82,8 +86,8 @@ N_JOBS = -1
 # 为每个因变量指定用于 SHAP 分析的模型（可选: 'XGBOOST' 或 'LightGBM'）
 # 根据实验结果选择各因变量表现最优的模型
 SHAP_MODEL_CONFIG = {
-    TARGET_A: 'LightGBM',   # 步行比例 — LightGBM 表现最优
-    TARGET_B: 'XGBOOST',    # 步行距离 — XGBoost 表现最优
+    TARGET_A: 'XGBOOST',
+    TARGET_B: 'LightGBM',
 }
 
 # SHAP 依赖图选取的 Top 特征数量
@@ -103,80 +107,102 @@ MODEL_COLORS = {
 # ============ TARGET 主题色与色带配置 ============
 from matplotlib.colors import LinearSegmentedColormap
 
-# 色带1（TARGET_A 步行比例）：蓝色（高值）→ 淡紫灰（中间值）→ 粉红/玫瑰色（低值）
-_CMAP_A_DIVERGING = LinearSegmentedColormap.from_list(
-    'BluLavenderPink',
-    ['#E91E63', '#F8BBD0', '#D7C4D9', '#BBDEFB', '#1565C0']
-)
-# 色带2（TARGET_B 步行距离）：黄色（高值）→ 淡灰绿（中间值）→ 浅青/墨青色（低值）
-_CMAP_B_DIVERGING = LinearSegmentedColormap.from_list(
-    'TealSageYellow',
-    ['#00695C', '#B2DFDB', '#C8D5C4', '#FFF9C4', '#F9A825']
-)
+# 主题一：Viridis 风格（高能暖色）- 顺序色谱
+# 颜色节点: 亮黄色（最高值） → 黄绿色 → 青绿色 → 深蓝色 → 深紫色（最低值）
+_CMAP_VIRIDIS_SEQUENTIAL = plt.cm.viridis
 
-# 色带1 的顺序版本（用于非发散型热力图，如交互矩阵）
-_CMAP_A_SEQUENTIAL = LinearSegmentedColormap.from_list(
-    'LavenderToPink', ['#F0E6EE', '#F8BBD0', '#E91E63', '#880E4F']
-)
-# 色带2 的顺序版本
-_CMAP_B_SEQUENTIAL = LinearSegmentedColormap.from_list(
-    'MintToTeal', ['#E6EDEB', '#B2DFDB', '#00897B', '#004D40']
-)
+# 主题二：RdBu 风格（冷暖对比）- 发散色谱
+# 颜色节点: 深蓝色（最高值） → 青色 → 浅绿色 → 米黄色（中间值） → 浅橙色 → 深红色（最低值）
+_CMAP_RDBU_DIVERGING = plt.cm.RdBu_r
 
-# 每个 TARGET 的完整主题色配置
-TARGET_THEME = {
-    TARGET_A: {
-        # 发散型色带（散点图、PDP、交互散点等）
-        'cmap_diverging': _CMAP_A_DIVERGING,
-        # 顺序型色带（交互矩阵热力图等）
-        'cmap_sequential': _CMAP_A_SEQUENTIAL,
-        # 主色调（LOWESS 线、置信区间、y=0 线等）
-        'primary': '#1565C0',        # 深蓝
-        # 强调色（阈值线、交叉点标注等）
-        'accent': '#C2185B',         # 玫瑰红
-        # 正向背景色（SHAP > 0 区域）
-        'bg_positive': '#E3F2FD',    # 浅蓝
-        # 负向背景色（SHAP < 0 区域）
-        'bg_negative': '#FCE4EC',    # 浅粉
-        # 图7 主效应条形图颜色
-        'bar_main': '#1565C0',       # 蓝色
-        # 图7 交互效应条形图颜色
-        'bar_interact': '#E91E63',   # 粉红
-        # 图11 特征重要性条形图颜色
-        'bar_importance': '#1976D2', # 蓝色
-        # 图12 正向节点 RGB（蓝色系）
-        'node_positive': (0.2, 0.4, 0.9),
-        # 图12 负向节点 RGB（粉红系）
-        'node_negative': (0.91, 0.12, 0.39),
-        # 图7 交互占比高阈值颜色
-        'ratio_high': '#C2185B',
-        # 图7 交互占比中阈值颜色
-        'ratio_mid': '#5C6BC0',
-        # 图7 交互占比低阈值颜色
-        'ratio_low': '#90A4AE',
-    },
-    TARGET_B: {
-        'cmap_diverging': _CMAP_B_DIVERGING,
-        'cmap_sequential': _CMAP_B_SEQUENTIAL,
-        'primary': '#00695C',        # 墨青
-        'accent': '#F57F17',         # 深黄
-        'bg_positive': '#E0F2F1',    # 浅青
-        'bg_negative': '#FFFDE7',    # 浅黄
-        'bar_main': '#00695C',       # 墨青
-        'bar_interact': '#F9A825',   # 黄色
-        'bar_importance': '#00796B', # 青色
-        'node_positive': (0.0, 0.41, 0.36),
-        'node_negative': (0.98, 0.66, 0.15),
-        'ratio_high': '#E65100',
-        'ratio_mid': '#00897B',
-        'ratio_low': '#90A4AE',
-    },
+# 主题一配置（Viridis - 用于步行联系度）
+THEME_VAR1 = {
+    'cmap_diverging': _CMAP_VIRIDIS_SEQUENTIAL,
+    'cmap_sequential': _CMAP_VIRIDIS_SEQUENTIAL,
+    'primary': '#44AA99',
+    'accent': '#FDB863',
+    'bg_positive': '#E6F5D0',
+    'bg_negative': '#FFF2CC',
+    'bar_main': '#44AA99',
+    'bar_interact': '#FDB863',
+    'bar_importance': '#44AA99',
+    'node_positive': (0.27, 0.67, 0.60),
+    'node_negative': (0.99, 0.72, 0.39),
+    'ratio_high': '#FDB863',
+    'ratio_mid': '#B2DFDB',
+    'ratio_low': '#556B2F',  # 【已修改】从 #C8D5C4 修改为深褐绿色，增加对比度
 }
 
+# 主题二配置（RdBu - 用于第二个变量）
+THEME_VAR2 = {
+    'cmap_diverging': _CMAP_RDBU_DIVERGING,
+    'cmap_sequential': _CMAP_VIRIDIS_SEQUENTIAL,  # 交互矩阵仍用viridis保持一致性
+    'primary': '#2A78B4',  # RdBu 中间偏蓝
+    'accent': '#B42A2A',   # RdBu 中间偏红
+    'bg_positive': '#D1E5F0',
+    'bg_negative': '#FDDBC7',
+    'bar_main': '#2A78B4',
+    'bar_interact': '#B42A2A',
+    'bar_importance': '#44AA99',
+    'node_positive': (0.165, 0.471, 0.706),  # #2A78B4 RGB
+    'node_negative': (0.706, 0.165, 0.165),  # #B42A2A RGB
+    'ratio_high': '#B42A2A',
+    'ratio_mid': '#F7F7F7',
+    'ratio_low': '#2A78B4',
+}
 
 def get_theme(target_name):
-    """获取指定 TARGET 的主题色配置，若未找到则返回 TARGET_A 的配置作为默认值"""
-    return TARGET_THEME.get(target_name, TARGET_THEME[TARGET_A])
+    """获取指定 TARGET 的主题色配置，第一个变量用Viridis，第二个用RdBu"""
+    if target_name == "步行分担率":
+        return THEME_VAR2
+    else:
+        return THEME_VAR1
+
+
+def _worker_pdp_2d(rank, idx_a, idx_b, strength, model, X_all_scaled, feature_cols, theme, scaler, sub_dir):
+    """
+    单个二维 PDP 图的并行绘图工作函数
+    """
+    from sklearn.inspection import partial_dependence
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    feat_a, feat_b = feature_cols[idx_a], feature_cols[idx_b]
+
+    # 1. 计算二维偏依赖
+    pd_result = partial_dependence(
+        model, X_all_scaled, features=[(idx_a, idx_b)],
+        kind='average', grid_resolution=30
+    )
+
+    grid_a, grid_b = pd_result['grid_values'][0], pd_result['grid_values'][1]
+
+    # 2. 坐标反向标准化（还原原始量纲）
+    if scaler is not None:
+        grid_a = grid_a * scaler.scale_[idx_a] + scaler.mean_[idx_a]
+        grid_b = grid_b * scaler.scale_[idx_b] + scaler.mean_[idx_b]
+
+    xx, yy = np.meshgrid(grid_a, grid_b)
+    zz = pd_result['average'][0].T
+
+    # 3. 绘图
+    fig, ax = plt.subplots(figsize=(8, 6))
+    contour_filled = ax.contourf(xx, yy, zz, levels=10, cmap=theme['cmap_diverging'], alpha=0.9)
+    contour_lines = ax.contour(xx, yy, zz, levels=contour_filled.levels, colors='white', linewidths=0.8, alpha=0.7)
+    ax.clabel(contour_lines, inline=True, fontsize=10, fmt='%.2f', colors='black')
+
+    fig.colorbar(contour_filled, ax=ax, shrink=0.8, label='部分依赖值')
+    ax.set_xlabel(feat_a, fontsize=12)
+    ax.set_ylabel(feat_b, fontsize=12)
+    ax.set_title(f'Rank {rank}: {feat_a} × {feat_b}\n(强度={strength:.5f})', fontsize=13, fontweight='bold')
+
+    plt.tight_layout()
+
+    # 4. 保存
+    save_path = os.path.join(sub_dir, f'{rank:03d}_{feat_a}×{feat_b}.png')
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')  # 并行时建议200dpi，平衡速度与清晰度
+    plt.close(fig)
+    return f"Rank {rank} 完成"
 
 # ============ 日志 ============
 logging.basicConfig(
@@ -186,29 +212,94 @@ logging.basicConfig(
 )
 log = logging.getLogger('plot_shap')
 
+import threading
+
+
+def timed_continue_prompt(timeout=10):
+    """
+    带超时的用户确认提示
+    """
+    print(f"\n>>> [确认] 即将开始全量样本 SHAP 计算及 Top 100 密集绘图任务。")
+    print(f">>> 输入 'n' 中止，输入其他或等待 {timeout}s 将自动开始...")
+
+    user_input = [None]
+
+    def get_input():
+        try:
+            user_input[0] = sys.stdin.readline().strip().lower()
+        except:
+            pass
+
+    # 开启线程等待输入
+    input_thread = threading.Thread(target=get_input)
+    input_thread.daemon = True
+    input_thread.start()
+
+    # 等待指定的秒数
+    input_thread.join(timeout)
+
+    if user_input[0] is None:
+        print(f"\n>>> [超时] 未检测到输入，默认继续执行...\n")
+        return True
+    elif user_input[0] == 'n':
+        print("\n>>> [中止] 用户取消了绘图任务。")
+        sys.exit(0)
+    else:
+        print("\n>>> [继续] 收到确认，开始执行任务...\n")
+        return True
+
+
+def _worker_interaction_scatter(rank, i, j, strength, interaction_vals, x_vals, color_vals,
+                               feat_a, feat_b, theme, save_path):
+    """图8的并行工作函数"""
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(7, 5.5))
+
+    scatter = ax.scatter(x_vals, interaction_vals, c=color_vals, cmap=theme['cmap_diverging'],
+                         alpha=0.5, s=14, edgecolors='none')
+    ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+    ax.set_xlabel(feat_a, fontsize=11)
+    ax.set_ylabel(f'SHAP 交互值\n({feat_a} × {feat_b})', fontsize=10)
+    ax.set_title(f'Rank {rank}: {feat_a} × {feat_b}\n(强度={strength:.5f})', fontsize=12, fontweight='bold')
+
+    ax.spines['top'].set_visible(True)
+    ax.spines['right'].set_visible(True)
+    cbar = fig.colorbar(scatter, ax=ax, shrink=0.8)
+    cbar.set_label(feat_b, fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
 
 # ============ 数据加载 ============
-def load_data(target_cols):
-    """加载数据并返回特征矩阵、因变量字典、特征名"""
+def load_data(current_targets):
+    """
+    加载数据并返回特征矩阵、因变量字典、特征名。
+    current_targets: 当前脚本运行需要生成的因变量列表
+    """
     df = pd.read_csv(DATA_PATH, encoding='utf-8')
 
-    # 检查因变量是否存在
-    missing = [t for t in target_cols if t not in df.columns]
+    # 检查当前请求的因变量是否存在
+    missing = [t for t in current_targets if t not in df.columns]
     if missing:
         log.error(f"以下因变量在数据中不存在: {missing}")
-        log.error(f"数据中可用的列: {df.columns.tolist()}")
         sys.exit(1)
 
-    # 动态生成排除列
-    exclude_cols = ALWAYS_EXCLUDE + target_cols
+    # 修改逻辑：始终排除【所有】已知的因变量候选集，而不仅仅是当前分析的那个
+    # 这样可以确保“分析 A 时排除 B，分析 B 时排除 A”
+    exclude_cols = ALWAYS_EXCLUDE + ALL_TARGETS
+
+    # 动态获取特征列（确保这些列确实存在于 df 中）
     feature_cols = [c for c in df.columns if c not in exclude_cols]
+
+    # 提取特征矩阵 X
     X = df[feature_cols].values
 
-    # 返回因变量字典
-    y_dict = {t: df[t].values for t in target_cols}
+    # 只返回当前需要的因变量数据
+    y_dict = {t: df[t].values for t in current_targets}
 
     log.info(f"数据加载完成: {X.shape[0]} 样本, {len(feature_cols)} 特征")
-    log.info(f"因变量: {target_cols}")
+    log.info(f"已从特征中排除所有因变量: {ALL_TARGETS}")
     return X, y_dict, feature_cols
 
 
@@ -253,7 +344,7 @@ def train_all_models(X_train, y_train, X_test, y_test, all_params, feature_cols)
     trained_models = {}
     test_results = {}
 
-    # OLS
+    # OLS (始终训练，用于性能比较)
     X_train_const = sm.add_constant(X_train_s)
     X_test_const = sm.add_constant(X_test_s)
     ols_model = sm.OLS(y_train, X_train_const).fit()
@@ -340,7 +431,7 @@ def _plot_1a_r2_bar(test_results, target_name, shap_model_name, theme, save_path
                 f'{val:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
 
     ax.set_ylabel('R²', fontsize=12)
-    ax.set_title(f'{target_name} — 多模型 R² 对比', fontsize=13, fontweight='bold')
+    ax.set_title(f'{target_name} — 多模型R^2对比', fontsize=13, fontweight='bold')
     ax.set_ylim(0, max(r2_values) * 1.15)
     ax.grid(True, alpha=0.3, axis='y')
     ax.spines['top'].set_visible(True)
@@ -517,8 +608,8 @@ def _plot_1c_residual_hist(y_test, y_pred_test, shap_model_name, target_name,
     ax.set_title(f'{target_name} — {shap_model_name} 残差分布', fontsize=13, fontweight='bold')
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(True)
+    ax.spines['right'].set_visible(True)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -573,17 +664,16 @@ def plot_1_model_performance(y_test, test_results, target_name, shap_model_name=
 def plot_2_shap_bar(shap_values, feature_cols, target_name, plot_dir=PLOT_DIR):
     """SHAP 全局特征重要性条形图"""
     log.info(f"绘制图2: SHAP全局特征贡献图 — {target_name}")
-
     theme = get_theme(target_name)
 
     fig, ax = plt.subplots(figsize=(10, 8))
     shap.plots.bar(shap_values, max_display=len(feature_cols), show=False, ax=ax)
-    # 将条形图颜色统一为主题色
+
+    # 规范化：单一颜色选择 ratio_low
     for patch in ax.patches:
-        patch.set_facecolor(theme['bar_importance'])
-    # 移除条形图上的数字标注
-    for txt in ax.texts:
-        txt.remove()
+        patch.set_facecolor(theme['ratio_low'])
+
+    for txt in ax.texts: txt.remove()
     ax.set_title(f'{target_name} — SHAP 全局特征贡献', fontsize=14, fontweight='bold')
     plt.tight_layout()
     save_path = os.path.join(plot_dir, f'图2_SHAP特征贡献_{target_name}.png')
@@ -629,7 +719,7 @@ def _find_lowess_zero_crossings(lowess_x, lowess_y):
     return crossings
 
 
-def _compute_lowess_with_ci(feat_vals, shap_vals, frac=0.3, n_bootstrap=200):
+def _compute_lowess_with_ci(feat_vals, shap_vals, frac=0.5, n_bootstrap=200):
     """
     计算 LOWESS 拟合曲线及 Bootstrap 置信区间。
     返回: lowess_x, lowess_y, ci_lower, ci_upper
@@ -665,202 +755,144 @@ def _compute_lowess_with_ci(feat_vals, shap_vals, frac=0.3, n_bootstrap=200):
 
     return lowess_x, lowess_y, ci_lower, ci_upper
 
-
+# 图4 修正版片段
 def _plot_single_dependence(feat, feat_vals, shap_vals, theme, target_name, save_path):
-    """
-    为单个特征绘制 SHAP 依赖图（散点 + LOWESS + 内嵌柱状分布）。
-    柱状分布以灰色背景直方图形式嵌入散点图底部，无背景分区，无阈值标注。
-    """
-    fig, ax = plt.subplots(figsize=(7.5, 5.5))
+    fig, ax = plt.subplots(figsize=(10.0, 7.5))
+    lowess_x, lowess_y, ci_lower, ci_upper = _compute_lowess_with_ci(feat_vals, shap_vals)
 
-    # ---- 计算 LOWESS 拟合 + 置信区间 ----
-    lowess_x, lowess_y, ci_lower, ci_upper = _compute_lowess_with_ci(
-        feat_vals, shap_vals, frac=0.3, n_bootstrap=200
-    )
-
-    # ---- 坐标范围 ----
-    x_min, x_max = feat_vals.min(), feat_vals.max()
-    x_margin = (x_max - x_min) * 0.03
-    plot_xmin = x_min - x_margin
-    plot_xmax = x_max + x_margin
-
-    # 1. 内嵌柱状分布（灰色，贴在散点图底部，使用副轴）
     ax_hist = ax.twinx()
-    n_bins = min(30, max(10, len(feat_vals) // 10))
-    ax_hist.hist(feat_vals, bins=n_bins, color='#C0C0C0', alpha=0.35,
-                 edgecolor='white', linewidth=0.3, zorder=0)
-    # 将柱状图压缩到底部约 25% 的区域
-    hist_ymax = ax_hist.get_ylim()[1]
-    ax_hist.set_ylim(0, hist_ymax * 4)
-    ax_hist.set_yticks([])
-    ax_hist.spines['top'].set_visible(False)
-    ax_hist.spines['right'].set_visible(False)
-    ax_hist.spines['left'].set_visible(False)
-    ax_hist.spines['bottom'].set_visible(False)
+    ax_hist.hist(feat_vals, bins=30, color='#C0C0C0', alpha=0.3, zorder=0)
 
-    # 2. 散点图（单一颜色）
-    ax.scatter(feat_vals, shap_vals, color=theme['primary'],
-               alpha=0.35, s=14, edgecolors='none', zorder=2)
+    # 散点和基准线使用 low
+    ax.scatter(feat_vals, shap_vals, color=theme['ratio_low'], alpha=0.35, s=14, edgecolors='none', zorder=2)
+    ax.axhline(y=0, color=theme['ratio_low'], linestyle='--', linewidth=1, alpha=0.6, zorder=3)
 
-    # 3. LOWESS 曲线（使用强调色，与散点区分）
-    ax.plot(lowess_x, lowess_y, color=theme['accent'], linewidth=2.5, zorder=4, label='LOWESS')
+    # 拟合线和区间使用 high
+    ax.plot(lowess_x, lowess_y, color=theme['ratio_high'], linewidth=2.5, zorder=4, label='LOWESS')
+    ax.fill_between(lowess_x, ci_lower, ci_upper, alpha=0.2, color=theme['ratio_high'], zorder=3, label='95% 置信区间')
 
-    # 4. 置信区间
-    ax.fill_between(lowess_x, ci_lower, ci_upper, alpha=0.2, color=theme['accent'], zorder=3,
-                    label='95% 置信区间')
-
-    # 5. y=0 水平虚线
-    ax.axhline(y=0, color=theme['primary'], linestyle='--', linewidth=1, alpha=0.6, zorder=3)
-
-    ax.set_xlabel(f'{feat}', fontsize=11)
-    ax.set_ylabel('SHAP value', fontsize=11)
-    ax.set_xlim(plot_xmin, plot_xmax)
-    ax.grid(True, alpha=0.2, zorder=1)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.legend(loc='best', fontsize=8, framealpha=0.8)
-
+    ax.set_xlabel(f'{feat}', fontsize=24, color='black')
+    ax.set_ylabel('SHAP value', fontsize=24, color='black')
+    ax.spines['top'].set_visible(True) # 确认开启
+    ax.spines['right'].set_visible(True) # 确认开启
+    ax.tick_params(axis='both', labelsize=21, colors='black')
+    ax_hist.set_ylabel('样本数', fontsize=24, color='black')
+    ax_hist.tick_params(axis='y', labelsize=21, colors='black')
+    ax.legend(loc='best', fontsize=20)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
 
+def _worker_single_dependence(rank, feat, feat_vals, shap_vals, theme, target_name, save_path):
+    """图4的并行工作函数：仅封装调用逻辑"""
+    # 直接调用您原有的逻辑函数，保证内部逻辑 100% 一致
+    _plot_single_dependence(feat, feat_vals, shap_vals, theme, target_name, save_path)
+    return f"图4 - {feat} 完成"
 
-def plot_4_shap_dependence(shap_values, X_data, feature_cols, target_name, scaler=None, plot_dir=PLOT_DIR):
-    """
-    为所有自变量绘制增强版 SHAP 依赖图，每个特征单独一张图。
-    每张图包含：上方散点图 + LOWESS 曲线 + Bootstrap 置信区间 + 阈值标注 + 背景分区，
-    下方为特征值的柱状分布图。
-    所有图保存到 plot_dir/图4_SHAP依赖图/ 子目录中。
-    如果提供 scaler，则将横坐标还原为原始值（更直观）。
-    """
-    log.info(f"绘制图4: SHAP单特征依赖图（LOWESS增强版 + 柱状分布）— {target_name}")
 
+def plot_4_shap_dependence(shap_values, X_data, feature_cols, target_name, scaler=None, plot_dir=PLOT_DIR, max_features=None):
+    """并行化绘制图4"""
+    log.info(f"绘制图4: SHAP单特征依赖图（并行模式）— {target_name}")
     theme = get_theme(target_name)
-
-    # 创建子目录
     sub_dir = os.path.join(plot_dir, '图4_SHAP依赖图')
     os.makedirs(sub_dir, exist_ok=True)
 
-    # 按平均 |SHAP| 排序（用于文件名编号，方便按重要性排列）
     mean_abs_shap = np.abs(shap_values.values).mean(axis=0)
     sorted_indices = np.argsort(mean_abs_shap)[::-1]
+    if max_features is not None:
+        if max_features < 1:
+            raise ValueError('max_features 必须大于等于 1')
+        sorted_indices = sorted_indices[:max_features]
 
-    # 准备原始值数据（用于横坐标显示）
     if scaler is not None:
         X_display = scaler.inverse_transform(X_data)
     else:
         X_display = X_data
 
-    shap_vals_array = shap_values.values  # (n_samples, n_features)
+    shap_vals_array = shap_values.values
 
-    for rank, feat_idx in enumerate(sorted_indices, start=1):
-        feat = feature_cols[feat_idx]
-        feat_vals = X_display[:, feat_idx]
-        shap_vals = shap_vals_array[:, feat_idx]
+    log.info(f"  准备并行绘制 {len(sorted_indices)} 张依赖图...")
 
-        save_path = os.path.join(sub_dir, f'{rank:02d}_{feat}.png')
-        _plot_single_dependence(feat, feat_vals, shap_vals, theme, target_name, save_path)
-        log.info(f"  [{rank}/{len(feature_cols)}] 已保存: {save_path}")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=None) as executor:
+        futures = [
+            executor.submit(
+                _worker_single_dependence,
+                rank,
+                feature_cols[feat_idx],
+                X_display[:, feat_idx],
+                shap_vals_array[:, feat_idx],
+                theme,
+                target_name,
+                os.path.join(sub_dir, f'{rank:02d}_{feature_cols[feat_idx]}.png')
+            )
+            for rank, feat_idx in enumerate(sorted_indices, start=1)
+        ]
 
-    log.info(f"  图4全部完成，共 {len(feature_cols)} 张图，保存于: {sub_dir}")
+        # 实时监控进度
+        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            if i % 5 == 0:
+                log.info(f"  图4进度: {i}/{len(sorted_indices)}...")
+
+    log.info(f"  图4并行绘制完成，保存于: {sub_dir}")
 
 
 # =====================================================================
 #  图5: 二维 PDP 部分依赖图
 # =====================================================================
-def plot_5_pdp_2d(model, X_train_scaled, feature_cols, target_name,
+def plot_5_pdp_2d(model, X_all_scaled, feature_cols, target_name,
                   shap_interaction=None, scaler=None, plot_dir=PLOT_DIR):
     """
-    为每个变量找到与其 SHAP 交互最强的搭档，绘制二维 PDP 热力图。
-    每个变量一张图，保存到 plot_dir/图5_二维PDP/ 子目录中。
-    如果提供 scaler，则将坐标轴还原为原始值。
+    修改版：并行化绘制全域交互强度最高的 Top 100 对特征的二维 PDP。
     """
-    log.info(f"绘制图5: 二维PDP部分依赖图（按最强交互配对）— {target_name}")
-
+    log.info(f"绘制图5: 二维PDP部分依赖图（并行模式 - Top 100）— {target_name}")
     theme = get_theme(target_name)
-    from sklearn.inspection import partial_dependence
 
-    # 创建子目录
     sub_dir = os.path.join(plot_dir, '图5_二维PDP')
     os.makedirs(sub_dir, exist_ok=True)
 
     n_features = len(feature_cols)
 
-    # ---- 计算每个变量的最强交互搭档 ----
+    # 1. 计算/提取交互矩阵（逻辑不变）
     if shap_interaction is not None:
-        # 使用传入的 SHAP 交互值
         interaction_matrix = np.abs(shap_interaction).mean(axis=0)
     else:
-        # 如果没有传入，自行计算
-        log.info("  未传入 shap_interaction，自行计算...")
         explainer = shap.TreeExplainer(model)
-        shap_inter = explainer.shap_interaction_values(
-            pd.DataFrame(X_train_scaled, columns=feature_cols)
-        )
+        shap_inter = explainer.shap_interaction_values(pd.DataFrame(X_all_scaled, columns=feature_cols))
         interaction_matrix = np.abs(shap_inter).mean(axis=0)
 
-    # 按 SHAP 重要性排序（用于文件名编号）
-    explainer_shap = shap.TreeExplainer(model)
-    shap_vals = explainer_shap(pd.DataFrame(X_train_scaled, columns=feature_cols))
-    mean_abs_shap = np.abs(shap_vals.values).mean(axis=0)
-    sorted_indices = np.argsort(mean_abs_shap)[::-1]
+    # 2. 获取特征对并排序
+    all_pairs = []
+    for i in range(n_features):
+        for j in range(i + 1, n_features):
+            all_pairs.append((i, j, interaction_matrix[i, j]))
 
-    # 为每个变量找到交互最强的搭档
-    total = n_features
-    for rank, feat_idx_a in enumerate(sorted_indices, start=1):
-        feat_a = feature_cols[feat_idx_a]
+    all_pairs.sort(key=lambda x: x[2], reverse=True)
+    top_n_pairs = all_pairs[:100]
 
-        # 找到与 feat_a 交互最强的变量（排除自身对角线）
-        inter_strengths = interaction_matrix[feat_idx_a].copy()
-        inter_strengths[feat_idx_a] = -1  # 排除自身
-        feat_idx_b = np.argmax(inter_strengths)
-        feat_b = feature_cols[feat_idx_b]
-        strength = inter_strengths[feat_idx_b]
+    log.info(f"  准备并行分发 {len(top_n_pairs)} 个绘图任务（使用 {os.cpu_count()} 个核心）...")
 
-        log.info(f"  [{rank}/{total}] {feat_a} 的最强交互搭档: {feat_b} (强度={strength:.5f})")
+    # 3. 使用进程池进行并行处理
+    # 使用 max_workers=None 默认使用所有 CPU 核心
+    with concurrent.futures.ProcessPoolExecutor(max_workers=None) as executor:
+        # 准备任务列表
+        futures = [
+            executor.submit(
+                _worker_pdp_2d,
+                rank, idx_a, idx_b, strength,
+                model, X_all_scaled, feature_cols,
+                theme, scaler, sub_dir
+            )
+            for rank, (idx_a, idx_b, strength) in enumerate(top_n_pairs, start=1)
+        ]
 
-        # 计算二维偏依赖
-        pd_result = partial_dependence(
-            model, X_train_scaled, features=[(feat_idx_a, feat_idx_b)],
-            kind='average', grid_resolution=30
-        )
+        # 监控进度
+        done_count = 0
+        for future in concurrent.futures.as_completed(futures):
+            done_count += 1
+            if done_count % 20 == 0:
+                log.info(f"  已完成 {done_count}/100...")
 
-        grid_a = pd_result['grid_values'][0]
-        grid_b = pd_result['grid_values'][1]
-
-        # 如果提供了 scaler，将网格值反标准化为原始值
-        if scaler is not None:
-            mean_a, std_a = scaler.mean_[feat_idx_a], scaler.scale_[feat_idx_a]
-            mean_b, std_b = scaler.mean_[feat_idx_b], scaler.scale_[feat_idx_b]
-            grid_a = grid_a * std_a + mean_a
-            grid_b = grid_b * std_b + mean_b
-
-        xx, yy = np.meshgrid(grid_a, grid_b)
-        zz = pd_result['average'][0].T  # 转置以匹配 meshgrid
-
-        # ---- 绘图 ----
-        fig, ax = plt.subplots(figsize=(8, 6))
-
-        n_levels = 8
-        contour_filled = ax.contourf(xx, yy, zz, levels=n_levels, cmap=theme['cmap_diverging'], alpha=0.9)
-        contour_lines = ax.contour(xx, yy, zz, levels=contour_filled.levels, colors='white',
-                                   linewidths=0.8, alpha=0.7)
-        clbl = ax.clabel(contour_lines, inline=True, fontsize=13, fmt='%.2f', colors='black')
-        for txt in clbl:
-            txt.set_fontweight('bold')
-        fig.colorbar(contour_filled, ax=ax, shrink=0.8, label='部分依赖值')
-        ax.set_xlabel(feat_a, fontsize=12)
-        ax.set_ylabel(feat_b, fontsize=12)
-        ax.set_title(f'{feat_a} × {feat_b}  (交互强度={strength:.5f})',
-                     fontsize=13, fontweight='bold')
-
-        plt.tight_layout()
-        save_path = os.path.join(sub_dir, f'{rank:02d}_{feat_a}×{feat_b}.png')
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-
-    log.info(f"  图5全部完成，共 {total} 张图，保存于: {sub_dir}")
-
+    log.info(f"  图5并行绘图全部完成，结果保存于: {sub_dir}")
 
 # =====================================================================
 #  图6: 特征交互效应复合矩阵图
@@ -959,10 +991,12 @@ def plot_7_main_vs_interaction(shap_values, shap_interaction, feature_cols, targ
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8), gridspec_kw={'width_ratios': [3, 1]})
 
-    # 左图：堆叠条形图
-    y_pos = np.arange(n_features)
-    ax1.barh(y_pos, sorted_main, color=theme['bar_main'], label='主效应', height=0.7)
-    ax1.barh(y_pos, sorted_inter, left=sorted_main, color=theme['bar_interact'], label='交互效应', height=0.7)
+    y_pos = np.arange(len(sorted_features))
+    # 左图：双色对比
+    # 主效应：使用 ratio_low
+    ax1.barh(y_pos, sorted_main, color=theme['ratio_low'], label='主效应', height=0.7)
+    # 交互效应：使用 ratio_high
+    ax1.barh(y_pos, sorted_inter, left=sorted_main, color=theme['ratio_high'], label='交互效应', height=0.7)
     ax1.set_yticks(y_pos)
     ax1.set_yticklabels(sorted_features, fontsize=9)
     ax1.set_xlabel('平均 |SHAP 值|', fontsize=12)
@@ -1003,72 +1037,49 @@ def plot_7_main_vs_interaction(shap_values, shap_interaction, feature_cols, targ
 # =====================================================================
 #  图8: SHAP 成对交互散点图
 # =====================================================================
-def plot_8_interaction_scatter(shap_interaction, X_data, feature_cols, target_name,
+def plot_8_interaction_scatter(shap_interaction, X_all_scaled, feature_cols, target_name,
                                top_pairs=None, scaler=None, plot_dir=PLOT_DIR):
-    """
-    为交互最强的 Top 5 变量对绘制 SHAP 交互散点图，每对单独一张图。
-    横轴=变量A的值，纵轴=A与B的SHAP交互值，颜色=变量B的值。
-    如果提供 scaler，则将横轴和颜色编码还原为原始值。
-    所有图保存到 plot_dir/图8_交互散点图/ 子目录中，按交互强度排名编号。
-    """
-    log.info(f"绘制图8: SHAP成对交互散点图（Top 5）— {target_name}")
-
+    """并行化绘制图8"""
+    log.info(f"绘制图8: SHAP成对交互散点图（并行模式 - Top 100）— {target_name}")
     theme = get_theme(target_name)
-
-    # 创建子目录
     sub_dir = os.path.join(plot_dir, '图8_交互散点图')
     os.makedirs(sub_dir, exist_ok=True)
 
-    # 计算所有变量对的交互强度并排序
     n_features = len(feature_cols)
     pairs_strength = []
     for i in range(n_features):
         for j in range(i + 1, n_features):
             val = np.abs(shap_interaction[:, i, j]).mean()
             pairs_strength.append((i, j, val))
+
     pairs_strength.sort(key=lambda x: x[2], reverse=True)
-    pairs_strength = pairs_strength[:5]  # 只取 Top 5 交互对
+    pairs_strength = pairs_strength[:100]
 
-    # 如果提供了 scaler，将特征值反标准化为原始值
-    if scaler is not None:
-        X_display = scaler.inverse_transform(X_data)
-    else:
-        X_display = X_data
+    X_display = scaler.inverse_transform(X_all_scaled) if scaler is not None else X_all_scaled
 
-    total = len(pairs_strength)
-    for rank, (i, j, strength) in enumerate(pairs_strength, start=1):
-        feat_a = feature_cols[i]
-        feat_b = feature_cols[j]
+    log.info(f"  准备并行绘制前 100 对交互散点图...")
 
-        fig, ax = plt.subplots(figsize=(7, 5.5))
+    with concurrent.futures.ProcessPoolExecutor(max_workers=None) as executor:
+        futures = [
+            executor.submit(
+                _worker_interaction_scatter,
+                rank, i, j, strength,
+                shap_interaction[:, i, j],
+                X_display[:, i],
+                X_display[:, j],
+                feature_cols[i],
+                feature_cols[j],
+                theme,
+                os.path.join(sub_dir, f'{rank:03d}_{feature_cols[i]}×{feature_cols[j]}.png')
+            )
+            for rank, (i, j, strength) in enumerate(pairs_strength, start=1)
+        ]
 
-        # SHAP 交互值
-        interaction_vals = shap_interaction[:, i, j]
-        x_vals = X_display[:, i]
-        color_vals = X_display[:, j]
+        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            if i % 20 == 0:
+                log.info(f"  图8进度: {i}/100...")
 
-        scatter = ax.scatter(x_vals, interaction_vals, c=color_vals, cmap=theme['cmap_diverging'],
-                             alpha=0.5, s=14, edgecolors='none')
-        ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
-        ax.set_xlabel(feat_a, fontsize=11)
-        ax.set_ylabel(f'SHAP 交互值\n({feat_a} × {feat_b})', fontsize=10)
-        ax.set_title(f'{target_name} — {feat_a} × {feat_b}\n(交互强度={strength:.5f})',
-                     fontsize=12, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        cbar = fig.colorbar(scatter, ax=ax, shrink=0.8)
-        cbar.set_label(feat_b, fontsize=9)
-
-        plt.tight_layout()
-        save_path = os.path.join(sub_dir, f'{rank:03d}_{feat_a}×{feat_b}.png')
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-
-        if rank <= 5 or rank == total:
-            log.info(f"  [{rank}/{total}] 已保存: {save_path}")
-
-    log.info(f"  图8完成，共 {total} 张图（Top 5），保存于: {sub_dir}")
+    log.info(f"  图8并行绘制完成，保存于: {sub_dir}")
 
 
 # =====================================================================
@@ -1076,13 +1087,30 @@ def plot_8_interaction_scatter(shap_interaction, X_data, feature_cols, target_na
 # =====================================================================
 def plot_9_shap_heatmap(shap_values, feature_cols, target_name, plot_dir=PLOT_DIR):
     """
-    SHAP 热力图：横轴为特征，纵轴为样本（按预测值排序），颜色为 SHAP 值。
+    SHAP 热力图：直接在函数调用中设置 cmap，避免索引错误。
     """
     log.info(f"绘制图9: SHAP热力图 — {target_name}")
+    theme = get_theme(target_name)
 
-    fig, ax = plt.subplots(figsize=(14, 10))
-    shap.plots.heatmap(shap_values, max_display=len(feature_cols), show=False, ax=ax)
-    ax.set_title(f'{target_name} — SHAP 热力图', fontsize=14, fontweight='bold')
+    # 清理当前图形，防止 Axes 冲突
+    plt.clf()
+
+    # 直接在调用时传入 cmap
+    # 注意：shap.plots.heatmap 内部会处理 Axes 分配
+    shap.plots.heatmap(
+        shap_values,
+        max_display=len(feature_cols),
+        show=False,
+        cmap=theme['cmap_diverging']
+    )
+
+    # 获取当前的 Figure 进行修饰
+    fig = plt.gcf()
+    fig.set_size_inches(14, 10)
+
+    # 尝试为当前坐标系添加标题
+    plt.title(f'{target_name} — SHAP 热力图', fontsize=14, fontweight='bold', pad=20)
+
     plt.tight_layout()
     save_path = os.path.join(plot_dir, f'图9_SHAP热力图_{target_name}.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -1122,8 +1150,8 @@ def plot_10_residuals(y_test, test_results, target_name, plot_dir=PLOT_DIR):
         ax.set_ylabel('残差', fontsize=11)
         ax.set_title(f'{target_name} — {name} 残差图（测试集）', fontsize=13, fontweight='bold')
         ax.grid(True, alpha=0.3)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
+        ax.spines['top'].set_visible(True)
+        ax.spines['right'].set_visible(True)
 
         plt.tight_layout()
         save_path = os.path.join(sub_dir, f'{idx + 1:02d}_{name}.png')
@@ -1137,34 +1165,23 @@ def plot_10_residuals(y_test, test_results, target_name, plot_dir=PLOT_DIR):
 # =====================================================================
 #  图11: 最佳树模型特征重要性图
 # =====================================================================
-def plot_11_feature_importance(trained_models, test_results, feature_cols, target_name, plot_dir=PLOT_DIR):
+def plot_11_feature_importance(trained_models, model_name, feature_cols, target_name, plot_dir=PLOT_DIR):
     """
-    使用测试集 R² 最高的树模型绘制特征重要性条形图。
-    从 experiment.py 迁移而来。
+    使用设定的 SHAP 分析模型绘制特征重要性条形图。
     """
-    log.info(f"绘制图11: 特征重要性图 — {target_name}")
+    log.info(f"绘制图11: 特征重要性图 — {target_name} (使用设定模型: {model_name})")
 
-    # 找到测试集 R² 最高的树模型
-    tree_models = ['GBDT', 'RF', 'XGBOOST', 'LightGBM']
-    best_tree_name = None
-    best_r2 = -np.inf
-    for name in tree_models:
-        if name in test_results and name in trained_models:
-            r2 = test_results[name]['metrics']['R\u00b2']
-            if r2 > best_r2:
-                best_r2 = r2
-                best_tree_name = name
-
-    if best_tree_name is None:
-        log.warning("  未找到可用的树模型，跳过特征重要性图")
+    # 直接获取设定的模型
+    if model_name not in trained_models:
+        log.warning(f"  在已训练模型中未找到 {model_name}，跳过图11")
         return
 
-    best_model = trained_models[best_tree_name]
+    best_model = trained_models[model_name]
+
+    # 检查模型是否支持该属性（如 OLS 就不支持）
     if not hasattr(best_model, 'feature_importances_'):
-        log.warning(f"  {best_tree_name} 不支持 feature_importances_，跳过")
+        log.warning(f"  {model_name} 不支持 feature_importances_ 属性，跳过图11")
         return
-
-    log.info(f"  使用最佳树模型: {best_tree_name} (R\u00b2={best_r2:.4f})")
 
     importance = best_model.feature_importances_
     feat_imp = pd.DataFrame({
@@ -1174,14 +1191,16 @@ def plot_11_feature_importance(trained_models, test_results, feature_cols, targe
 
     fig, ax = plt.subplots(figsize=(10, 8))
     theme = get_theme(target_name)
-    ax.barh(feat_imp['特征'], feat_imp['重要性'], color=theme['bar_importance'], alpha=0.8)
-    ax.set_xlabel('特征重要性', fontsize=12)
-    ax.set_title(f'{target_name} — {best_tree_name}（调优后）特征重要性', fontsize=14, fontweight='bold')
-    ax.grid(True, alpha=0.3, axis='x')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    plt.tight_layout()
 
+    # 绘图逻辑
+    ax.barh(feat_imp['特征'], feat_imp['重要性'], color=theme['ratio_low'], alpha=0.8)
+    ax.set_xlabel('特征重要性', fontsize=12)
+    ax.set_title(f'{target_name} — {model_name} 特征重要性', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='x')
+    ax.spines['top'].set_visible(True)
+    ax.spines['right'].set_visible(True)
+
+    plt.tight_layout()
     save_path = os.path.join(plot_dir, f'图11_特征重要性_{target_name}.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -1250,13 +1269,21 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
     ax.set_facecolor('white')
     fig.set_facecolor('white')
 
-    # -- 紫色渐变 colormap（用于强边） --
-    purple_cmap = LinearSegmentedColormap.from_list(
-        'purple_edge', ['#F0E6FF', '#C9A0DC', '#9B59B6', '#6C3483', '#2E0854'])
+    # 根据因变量名称动态设定渐变色列表
+    if target_name == "步行分担率":
+        # 步行分担率：边=红色渐变，节点=蓝色渐变
+        edge_colors_list = ['#FFF5F0', '#FCBBA1', '#FB6A4A', '#CB181D', '#67000D']
+        node_colors_list = ['#F7FBFF', '#DEEBF7', '#6BAED6', '#2171B5', '#08306B']
+        vint_label, vimp_label = '交互强度 (Vint)', '特征影响 (Vimp)'
+    else:
+        # 步行联系度：边=紫色渐变，节点=黄色渐变
+        edge_colors_list = ['#F0E6FF', '#C9A0DC', '#9B59B6', '#6C3483', '#2E0854']
+        node_colors_list = ['#FFFFE5', '#FFF7BC', '#FEE391', '#FEC44F', '#CC4C02']
+        vint_label, vimp_label = '交互强度 (Vint)', '特征影响 (Vimp)'
 
-    # -- 绿色渐变 colormap（用于节点） --
-    green_cmap = LinearSegmentedColormap.from_list(
-        'green_node', ['#E8F5E9', '#A5D6A7', '#4CAF50', '#2E7D32', '#1B5E20'])
+    # 定义 Colormap
+    vint_cmap = LinearSegmentedColormap.from_list('vint_map', edge_colors_list)
+    vimp_cmap = LinearSegmentedColormap.from_list('vimp_map', node_colors_list)
 
     # -- 先绘制弱边（灰色细线，画在底层） --
     if weak_edges:
@@ -1268,7 +1295,7 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
                                style='solid',
                                alpha=0.6)
 
-    # -- 再绘制强边（紫色渐变，画在上层） --
+    # -- 再绘制强边（动态渐变色，画在上层） --
     if strong_edges:
         strong_edge_list = [(feature_cols[i], feature_cols[j]) for i, j, _ in strong_edges]
         strong_weights = np.array([s for _, _, s in strong_edges])
@@ -1284,8 +1311,8 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
         else:
             strong_widths = np.full_like(strong_weights, 3.0)
 
-        # 边颜色：紫色渐变
-        strong_colors = [purple_cmap(edge_norm(w)) for w in strong_weights]
+        # 边颜色：使用 vint_cmap
+        strong_colors = [vint_cmap(edge_norm(w)) for w in strong_weights]
 
         nx.draw_networkx_edges(G, pos, ax=ax,
                                edgelist=strong_edge_list,
@@ -1307,8 +1334,8 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
     else:
         node_sizes = np.full_like(node_importances, 1200)
 
-    # 节点颜色：绿色渐变
-    node_colors = [green_cmap(node_norm(imp)) for imp in node_importances]
+    # 节点颜色：使用 vimp_cmap
+    node_colors = [vimp_cmap(node_norm(imp)) for imp in node_importances]
 
     # 绘制节点
     nx.draw_networkx_nodes(G, pos, ax=ax,
@@ -1344,24 +1371,23 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
                  fontsize=15, fontweight='bold', pad=20)
     ax.axis('off')
 
+    # ---- 6. 双 colorbar (修长垂直版) ----
     # 留出右侧空间给 colorbar
-    plt.subplots_adjust(right=0.82)
+    plt.subplots_adjust(right=0.85)
 
-    # ---- 6. 双 colorbar ----
-    # Vint colorbar（紫色，上方）
     cbar_ax1 = fig.add_axes([0.86, 0.55, 0.025, 0.30])
-    sm1 = ScalarMappable(cmap=purple_cmap, norm=edge_norm)
+    sm1 = ScalarMappable(cmap=vint_cmap, norm=edge_norm)
     sm1.set_array([])
     cb1 = fig.colorbar(sm1, cax=cbar_ax1)
-    cb1.set_label('Vint', fontsize=12, fontweight='bold')
+    cb1.set_label(vint_label, fontsize=11, fontweight='bold', labelpad=10)
     cb1.ax.tick_params(labelsize=9)
 
-    # Vimp colorbar（绿色，下方）
+    # Vimp colorbar (下方，宽度 0.015)
     cbar_ax2 = fig.add_axes([0.86, 0.15, 0.025, 0.30])
-    sm2 = ScalarMappable(cmap=green_cmap, norm=node_norm)
+    sm2 = ScalarMappable(cmap=vimp_cmap, norm=node_norm)
     sm2.set_array([])
     cb2 = fig.colorbar(sm2, cax=cbar_ax2)
-    cb2.set_label('Vimp', fontsize=12, fontweight='bold')
+    cb2.set_label(vimp_label, fontsize=11, fontweight='bold', labelpad=10)
     cb2.ax.tick_params(labelsize=9)
 
     save_path = os.path.join(plot_dir, f'图12_SHAP特征交互网络图_{target_name}.png')
@@ -1381,13 +1407,13 @@ def plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_nam
 # =====================================================================
 #  主流程
 # =====================================================================
-def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
+def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None, max_features=None):
     """
     为指定因变量运行所有图例绘制。
-    plot_ids: 要绘制的图例编号列表，None 表示全部绘制。
+    已修改：SHAP 计算和导出现在基于全量样本（3000+），而非仅训练集。
     """
     log.info(f"\n{'='*70}")
-    log.info(f"  开始绘制: {target_name}")
+    log.info(f"  开始绘制: {target_name} (全样本分析模式)")
     log.info(f"{'='*70}")
 
     # 根据因变量名称创建子目录
@@ -1400,21 +1426,22 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
     if all_params is None:
         return
 
-    # 划分数据集（与 experiment.py 一致）
+    # 1. 划分数据集用于模型训练和性能验证 (保持与 experiment.py 一致)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
     )
-    log.info(f"  数据划分: 训练集 {X_train.shape[0]}, 测试集 {X_test.shape[0]}")
+    log.info(f"  模型训练划分: 训练集 {X_train.shape[0]}, 测试集 {X_test.shape[0]}")
 
-    # 训练所有模型
-    log.info("  训练所有模型...")
+    # 2. 训练所有模型并获取标准化器
+    log.info("  训练所有模型以确定性能...")
     trained_models, test_results, scaler = train_all_models(
         X_train, y_train, X_test, y_test, all_params, feature_cols
     )
 
-    # 标准化后的数据
-    X_train_scaled = scaler.transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    # 3. 准备【全量样本】的标准化数据用于 SHAP 分析
+    # 将输入的原始 X 全部进行标准化处理
+    X_all_scaled = scaler.transform(X)
+    log.info(f"  SHAP 分析将基于全量样本进行，样本总数: {X_all_scaled.shape[0]}")
 
     # 获取 SHAP 分析所用的模型
     shap_model_name = SHAP_MODEL_CONFIG.get(target_name, 'XGBOOST')
@@ -1424,12 +1451,19 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
         return
     log.info(f"  SHAP 分析模型: {shap_model_name}")
 
+    # ============ 新增：超时确认逻辑 ============
+    # 在正式开始高负载计算前停顿，等待用户确认或超时
+    if not timed_continue_prompt(timeout=10):
+        return
+    # ==========================================
+
     should_plot = lambda n: plot_ids is None or n in plot_ids
 
-    # ===== 图1: 模型性能验证图 =====
+
+    # ===== 图1: 模型性能验证图 (依然基于测试集展示泛化能力) =====
     if should_plot(1):
-        # 计算训练集预测值（用于 Joint Plot）
         train_preds = {}
+        X_train_scaled = scaler.transform(X_train)
         for m_name, m_obj in trained_models.items():
             if m_name == 'OLS':
                 X_train_const = sm.add_constant(X_train_scaled)
@@ -1447,71 +1481,77 @@ def run_plots_for_target(target_name, y, X, feature_cols, plot_ids=None):
 
     # ===== 图11: 特征重要性图 =====
     if should_plot(11):
-        plot_11_feature_importance(trained_models, test_results, feature_cols, target_name, plot_dir=target_plot_dir)
+        plot_11_feature_importance(trained_models, shap_model_name, feature_cols, target_name, plot_dir=target_plot_dir)
+    # =================================================================
+    #  核心修改：计算全量样本的 SHAP 值
+    # =================================================================
+    shap_values = None
+    if any(should_plot(n) for n in [2, 3, 4, 9, 12]):
+        # 注意：这里传入的是 X_all_scaled
+        shap_values, explainer = compute_shap_values(
+            shap_model, X_all_scaled, feature_cols
+        )
 
-        # ===== 计算 SHAP 值（图2/3/4/9/12 共用） =====
-        shap_values = None
-        if any(should_plot(n) for n in [2, 3, 4, 9, 12]):
-            shap_values, explainer = compute_shap_values(
-                shap_model, X_train_scaled, feature_cols
-            )
+        # ===== 导出全量样本的 SHAP 值到 CSV =====
+        shap_df = pd.DataFrame(shap_values.values, columns=feature_cols)
+        shap_df.insert(0, '样本序号', range(len(shap_df)))
+        # 加入基准值
+        shap_df['base_value'] = shap_values.base_values
+        csv_path = os.path.join(target_plot_dir, f'SHAP值_逐样本_全量_{target_name}.csv')
+        shap_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+        log.info(f"  【全量导出】SHAP值CSV已保存: {csv_path} (共 {shap_df.shape[0]} 样本)")
 
-            # ===== 导出每个样本的 SHAP 值到 CSV =====
-            shap_df = pd.DataFrame(shap_values.values, columns=feature_cols)
-            shap_df.insert(0, '样本序号', range(len(shap_df)))
-            shap_df['base_value'] = shap_values.base_values
-            csv_path = os.path.join(target_plot_dir, f'SHAP值_逐样本_{target_name}.csv')
-            shap_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-            log.info(f"  SHAP值CSV已导出: {csv_path} ({shap_df.shape[0]} 样本 × {len(feature_cols)} 特征)")
-
-    # ===== 图2: SHAP Bar Plot =====
+    # ===== 图2: SHAP Bar Plot (全量) =====
     if should_plot(2) and shap_values is not None:
         plot_2_shap_bar(shap_values, feature_cols, target_name, plot_dir=target_plot_dir)
 
-    # ===== 图3: SHAP Beeswarm =====
+    # ===== 图3: SHAP Beeswarm (全量) =====
     if should_plot(3) and shap_values is not None:
         plot_3_shap_beeswarm(shap_values, feature_cols, target_name, plot_dir=target_plot_dir)
 
-    # ===== 图4: SHAP Dependence =====
+    # ===== 图4: SHAP Dependence (全量) =====
     if should_plot(4) and shap_values is not None:
-        plot_4_shap_dependence(shap_values, X_train_scaled, feature_cols, target_name, scaler=scaler, plot_dir=target_plot_dir)
+        plot_4_shap_dependence(shap_values, X_all_scaled, feature_cols, target_name, scaler=scaler, plot_dir=target_plot_dir, max_features=max_features)
 
-    # ===== 计算 SHAP 交互值（图5/6/7/8/12 共用） =====
+    # =================================================================
+    #  核心修改：计算全量样本的 SHAP 交互值
+    # =================================================================
     shap_interaction = None
     if any(should_plot(n) for n in [5, 6, 7, 8, 12]):
+        # 注意：这里传入的是 X_all_scaled
         shap_interaction = compute_shap_interaction_values(
-            shap_model, X_train_scaled, feature_cols
+            shap_model, X_all_scaled, feature_cols
         )
 
-    # ===== 图5: 二维 PDP =====
+    # ===== 图5: 二维 PDP (全量) =====
     if should_plot(5):
-        plot_5_pdp_2d(shap_model, X_train_scaled, feature_cols, target_name,
+        plot_5_pdp_2d(shap_model, X_all_scaled, feature_cols, target_name,
                       shap_interaction=shap_interaction, scaler=scaler, plot_dir=target_plot_dir)
 
-    # ===== 图6: 交互效应矩阵 =====
+    # ===== 图6: 交互效应矩阵 (全量) =====
     top_pairs = None
     if should_plot(6) and shap_interaction is not None:
         top_pairs = plot_6_interaction_matrix(shap_interaction, feature_cols, target_name, plot_dir=target_plot_dir)
 
-    # ===== 图7: 主效应 vs 交互效应 =====
+    # ===== 图7: 主效应 vs 交互效应 (全量) =====
     if should_plot(7) and shap_interaction is not None:
         plot_7_main_vs_interaction(shap_values if shap_values is not None else None,
                                    shap_interaction, feature_cols, target_name, plot_dir=target_plot_dir)
 
-    # ===== 图8: 交互散点图 =====
+    # ===== 图8: 交互散点图 (全量) =====
     if should_plot(8) and shap_interaction is not None:
-        plot_8_interaction_scatter(shap_interaction, X_train_scaled, feature_cols,
+        plot_8_interaction_scatter(shap_interaction, X_all_scaled, feature_cols,
                                    target_name, top_pairs=top_pairs, scaler=scaler, plot_dir=target_plot_dir)
 
-    # ===== 图9: SHAP 热力图 =====
+    # ===== 图9: SHAP 热力图 (全量) =====
     if should_plot(9) and shap_values is not None:
         plot_9_shap_heatmap(shap_values, feature_cols, target_name, plot_dir=target_plot_dir)
 
-    # ===== 图12: SHAP 特征影响-交互网络图 =====
+    # ===== 图12: SHAP 特征影响-交互网络图 (全量) =====
     if should_plot(12) and shap_values is not None and shap_interaction is not None:
         plot_12_shap_network(shap_values, shap_interaction, feature_cols, target_name, plot_dir=target_plot_dir)
 
-    log.info(f"\n  {target_name} 所有图例绘制完成！")
+    log.info(f"\n  {target_name} 全量样本分析及图例绘制完成！")
     log.info(f"  图例保存在: {target_plot_dir}")
 
 
@@ -1528,10 +1568,14 @@ def parse_args():
         '--target', type=str, nargs='+', default=None,
         help=(
             '指定因变量（可多选，空格分隔）\n'
-            '例如: --target 步行比例\n'
-            '      --target 步行比例 步行距离\n'
+            '例如: --target 步行分担率\n'
+            '      --target 步行分担率 步行联系度\n'
             '不指定则自动检测数据中可用的因变量'
         )
+    )
+    parser.add_argument(
+        '--max-features', type=int, default=None,
+        help='限制图4输出的前 N 个特征；不指定则输出全部特征'
     )
     return parser.parse_args()
 
@@ -1550,25 +1594,19 @@ def main():
     else:
         log.info("  绘制全部图例 (1-12)")
 
-    # 确定因变量列表
+    # 1. 确定本次运行要处理的因变量（用户指定的或自动检测的）
     if args.target:
-        # 命令行指定
-        target_cols = args.target
+        current_run_targets = args.target
     else:
-        # 自动检测数据中存在的已知因变量
         df_head = pd.read_csv(DATA_PATH, encoding='utf-8', nrows=0)
-        known_targets = [TARGET_A, TARGET_B]
-        target_cols = [t for t in known_targets if t in df_head.columns]
-        if not target_cols:
-            log.error("数据中未找到任何已知因变量（步行比例/步行距离）")
-            sys.exit(1)
-        log.info(f"  自动检测到因变量: {target_cols}")
+        current_run_targets = [t for t in ALL_TARGETS if t in df_head.columns]
 
-    # 加载数据
-    X, y_dict, feature_cols = load_data(target_cols)
+    # 2. 调用修改后的加载函数
+    # 无论 current_run_targets 是多少，load_data 内部都会排除 ALL_TARGETS
+    X, y_dict, feature_cols = load_data(current_run_targets)
 
-    for target_name in target_cols:
-        run_plots_for_target(target_name, y_dict[target_name], X, feature_cols, plot_ids=args.plots)
+    for target_name in current_run_targets:
+        run_plots_for_target(target_name, y_dict[target_name], X, feature_cols, plot_ids=args.plots, max_features=args.max_features)
 
     log.info(f"\n{'='*70}")
     log.info(f"  所有图例绘制完成！")
